@@ -330,8 +330,9 @@ func isStalePolecatDone(workDir, rigName, polecatName string, msg *mail.Message)
 }
 
 // HandleLifecycleShutdown processes a LIFECYCLE:Shutdown message.
-// Similar to POLECAT_DONE but triggered by daemon rather than polecat.
-// Persistent polecat model (gt-4ac): sandbox preserved, polecat goes idle.
+// SESSION MANAGEMENT ONLY — NOT a work completion signal. Does NOT close beads,
+// create cleanup wisps, or nuke polecats. Polecat work completion is determined
+// by gt done / DiscoverCompletions, not by shutdown messages. (dc-q6ntn)
 func HandleLifecycleShutdown(workDir, rigName string, msg *mail.Message) *HandlerResult {
 	result := &HandlerResult{
 		MessageID:    msg.ID,
