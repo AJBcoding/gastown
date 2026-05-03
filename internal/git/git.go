@@ -167,13 +167,17 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 		var ctx context.Context
 		ctx, cancel = context.WithTimeout(context.Background(), timeout)
 		cmd = exec.CommandContext(ctx, "git", args...)
+		// Context-bound: install Cancel hook to kill the whole process group on
+		// timeout, preventing orphaned grandchildren (e.g. ssh subprocesses).
+		util.SetProcessGroup(cmd)
 	} else {
 		cmd = exec.Command("git", args...)
+		// No context: leave Cancel nil; just put the child in its own pgroup.
+		util.SetDetachedProcessGroup(cmd)
 	}
 	if cancel != nil {
 		defer cancel()
 	}
-	util.SetProcessGroup(cmd)
 
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
