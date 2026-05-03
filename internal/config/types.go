@@ -1475,9 +1475,10 @@ type AccountsConfig struct {
 
 // Account represents a single Claude Code account.
 type Account struct {
-	Email       string `json:"email"`                 // account email
-	Description string `json:"description,omitempty"` // human description
-	ConfigDir   string `json:"config_dir"`            // path to CLAUDE_CONFIG_DIR
+	Email             string `json:"email"`                          // account email
+	Description       string `json:"description,omitempty"`          // human description
+	ConfigDir         string `json:"config_dir"`                     // path to CLAUDE_CONFIG_DIR
+	WeeklyTokenBudget int    `json:"weekly_token_budget,omitempty"`  // weekly token budget; 0 = unknown (used by quota watch percentage math)
 }
 
 // CurrentAccountsVersion is the current schema version for AccountsConfig.

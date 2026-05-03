@@ -663,6 +663,84 @@ func TestAccountsConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAccountsConfigWeeklyTokenBudget(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Backward compat: existing config without the field loads with budget=0.
+	legacyPath := filepath.Join(dir, "legacy.json")
+	legacyJSON := []byte(`{
+  "version": 1,
+  "accounts": {
+    "old": {"email": "old@example.com", "config_dir": "~/.claude-accounts/old"}
+  },
+  "default": "old"
+}`)
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, legacyJSON, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	legacy, err := LoadAccountsConfig(legacyPath)
+	if err != nil {
+		t.Fatalf("LoadAccountsConfig(legacy): %v", err)
+	}
+	if got := legacy.Accounts["old"].WeeklyTokenBudget; got != 0 {
+		t.Errorf("legacy WeeklyTokenBudget = %d, want 0 (absent → zero-valued)", got)
+	}
+
+	// Round-trip: populated field survives save/load.
+	rtPath := filepath.Join(dir, "mayor", "accounts.json")
+	original := NewAccountsConfig()
+	original.Accounts["budgeted"] = Account{
+		Email:             "budgeted@example.com",
+		ConfigDir:         "~/.claude-accounts/budgeted",
+		WeeklyTokenBudget: 5_000_000,
+	}
+	original.Accounts["unbudgeted"] = Account{
+		Email:     "unbudgeted@example.com",
+		ConfigDir: "~/.claude-accounts/unbudgeted",
+	}
+	original.Default = "budgeted"
+	if err := SaveAccountsConfig(rtPath, original); err != nil {
+		t.Fatalf("SaveAccountsConfig: %v", err)
+	}
+	loaded, err := LoadAccountsConfig(rtPath)
+	if err != nil {
+		t.Fatalf("LoadAccountsConfig: %v", err)
+	}
+	if got := loaded.Accounts["budgeted"].WeeklyTokenBudget; got != 5_000_000 {
+		t.Errorf("budgeted WeeklyTokenBudget = %d, want 5000000", got)
+	}
+	if got := loaded.Accounts["unbudgeted"].WeeklyTokenBudget; got != 0 {
+		t.Errorf("unbudgeted WeeklyTokenBudget = %d, want 0 (omitempty + absent)", got)
+	}
+
+	// omitempty: serialized form must omit the field when zero.
+	raw, err := os.ReadFile(rtPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"weekly_token_budget": 5000000`) {
+		t.Errorf("serialized config missing populated weekly_token_budget; got: %s", raw)
+	}
+	// "unbudgeted" account block should not contain the key at all.
+	unbudgetedBlock := `"unbudgeted": {`
+	idx := strings.Index(string(raw), unbudgetedBlock)
+	if idx < 0 {
+		t.Fatalf("could not locate unbudgeted account block in serialized config: %s", raw)
+	}
+	end := strings.Index(string(raw)[idx:], "}")
+	if end < 0 {
+		t.Fatalf("malformed serialized config: %s", raw)
+	}
+	block := string(raw)[idx : idx+end+1]
+	if strings.Contains(block, "weekly_token_budget") {
+		t.Errorf("unbudgeted account block leaked weekly_token_budget key (omitempty broken): %s", block)
+	}
+}
+
 func TestAccountsConfigValidation(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
