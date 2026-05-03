@@ -405,11 +405,18 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	}
 
 	// Update agent state with retry logic (gt-94llt7: fail-safe Dolt writes).
-	// Note: warn-only, not fail-hard. The tmux session is already started above,
-	// so returning an error here would leave an orphaned session with no cleanup path.
-	// The polecat can still function without the agent state update — it only affects
-	// monitoring visibility, not correctness. Compare with createAgentBeadWithRetry
-	// which fails hard because a polecat without an agent bead is untrackable.
+	//
+	// hq-jhqi (2026-05-03): this update IS load-bearing for sling-reuse correctness,
+	// not just monitoring. If the next sling runs FindIdlePolecat before agent_state
+	// transitions to "working", it reuses this polecat for a different bead and
+	// silently drops the bond we just established (whack-a-mole). Retry budget is
+	// unified with doltMaxRetries (see doltStateRetries) to span Dolt read-visibility
+	// lag during rapid-fire dispatch.
+	//
+	// Still warn-only on terminal failure: the tmux session is already started above,
+	// so returning an error would leave an orphaned session. If the retries are
+	// exhausted, the next sling MAY still whack-a-mole this polecat — but with the
+	// extended budget that should be vanishingly rare.
 	polecatGit := git.NewGit(r.Path)
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
 	if err := polecatMgr.SetAgentStateWithRetry(s.PolecatName, "working"); err != nil {

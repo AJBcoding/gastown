@@ -39,14 +39,21 @@ const (
 	doltBaseBackoff = 500 * time.Millisecond
 	doltBackoffMax  = 30 * time.Second
 
-	// doltStateRetries is a reduced retry count for SetAgentStateWithRetry.
-	// Agent state is a monitoring concern, not a correctness requirement (see
-	// comment on SetAgentStateWithRetry). 10 retries with exponential backoff
-	// wastes ~2 minutes on persistent failures, blocking `gt sling` for no
-	// benefit since the caller already treats errors as warn-only.
-	// 3 retries (total backoff ~3.5s) is sufficient to ride out transient
-	// Dolt hiccups without punishing interactive workflows.
-	doltStateRetries = 3
+	// doltStateRetries is the retry count for SetAgentStateWithRetry.
+	//
+	// hq-jhqi (2026-05-03): agent state IS load-bearing for sling-reuse
+	// correctness, not just monitoring. FindIdlePolecat selects polecats whose
+	// derived state is idle; if a fresh sling fails to set agent_state="working"
+	// before the next sling runs FindIdlePolecat, the same polecat gets reused
+	// for a second bead — silently dropping the first bead's bond ("whack-a-mole").
+	//
+	// The previous 3-attempt budget (~3.5s of exponential backoff) was below the
+	// observed Dolt read-visibility lag during rapid-fire dispatch, producing
+	// "issue not found" false-negatives on the SetAgentState read-back. Unifying
+	// with doltMaxRetries gives ~150s of total backoff (capped at 30s per attempt),
+	// which is far longer than typical Dolt lag but only kicks in on persistent
+	// failure — happy-path latency is unchanged.
+	doltStateRetries = doltMaxRetries
 )
 
 // doltBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
