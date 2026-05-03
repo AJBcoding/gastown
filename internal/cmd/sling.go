@@ -109,6 +109,13 @@ Batch Slinging:
 	RunE: runSling,
 }
 
+// noSlingFileName is the sentinel file at the town root that blocks new
+// dispatches. Written by gt quota watch --soft when an account crosses
+// the soft threshold (hq-aten / N4). In-flight polecats finish; new
+// slings refuse with the sentinel's reason text. --force bypasses with
+// a warning. See hq-ern7 epic for the auto-stop design.
+const noSlingFileName = ".no-sling"
+
 var (
 	slingSubject     string
 	slingMessage     string
@@ -294,6 +301,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("finding town root: %w", err)
 	}
 	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	// Preflight: refuse if .no-sling sentinel is present (hq-ii12 / N5).
+	// Soft auto-stop: in-flight polecats finish, new dispatches block.
+	// --force bypasses with a warning.
+	if err := slingPreflight(townRoot, slingForce); err != nil {
+		return err
+	}
 
 	// Normalize target arguments: trim trailing slashes from target to handle tab-completion
 	// artifacts like "gt sling sl-123 slingshot/" → "gt sling sl-123 slingshot"
@@ -1248,4 +1262,33 @@ func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, 
 
 	// 3. Clean up the spawned polecat (worktree, agent bead, convoy, etc.)
 	cleanupSpawnedPolecat(spawnInfo, spawnInfo.RigName, convoyID)
+}
+
+// slingPreflight checks dispatch-blocking preconditions independent of bead and target.
+// Currently checks for the .no-sling sentinel at the town root. If present, returns an
+// error containing the sentinel's reason text. If force=true, prints a warning to stderr
+// and returns nil (preserves --force semantics for emergency operator override).
+//
+// The sentinel is written by gt quota watch --soft when an account crosses the soft
+// threshold (hq-aten / N4). In-flight polecats are unaffected; only new dispatches block.
+func slingPreflight(townRoot string, force bool) error {
+	sentinelPath := filepath.Join(townRoot, noSlingFileName)
+	data, err := os.ReadFile(sentinelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("checking %s sentinel: %w", noSlingFileName, err)
+	}
+	reason := strings.TrimSpace(string(data))
+	if reason == "" {
+		reason = "(no reason recorded)"
+	}
+	if force {
+		fmt.Fprintf(os.Stderr, "%s --force overrides %s sentinel: %s\n",
+			style.Dim.Render("Warning:"), noSlingFileName, reason)
+		return nil
+	}
+	return fmt.Errorf("refusing to sling: %s sentinel present at %s\n  reason: %s\n  override with --force",
+		noSlingFileName, sentinelPath, reason)
 }
