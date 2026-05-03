@@ -1471,6 +1471,13 @@ type AccountsConfig struct {
 	Version  int                `json:"version"`  // schema version
 	Accounts map[string]Account `json:"accounts"` // handle -> account details
 	Default  string             `json:"default"`  // default account handle
+
+	// UsagePatterns is an optional override for the regexes that quota.SamplePaneUsage
+	// uses to extract weekly percent-used from Claude Code's TUI output. Each pattern
+	// must contain exactly one numeric capture group (the percent integer). Empty/nil
+	// falls back to constants.DefaultWeeklyUsagePatterns. Lets operators adapt to
+	// upstream warning-text changes without a Gas Town rebuild (hq-kajs / N2).
+	UsagePatterns []string `json:"usage_patterns,omitempty"`
 }
 
 // Account represents a single Claude Code account.

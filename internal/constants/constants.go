@@ -442,3 +442,24 @@ var DefaultNearLimitPatterns = []string{
 	`\d+\s*(messages?|requests?)\s*(left|remaining)`,               // "10 messages remaining"
 }
 
+// DefaultWeeklyUsagePatterns are PROVISIONAL regexes for extracting an integer
+// percent-used signal from Claude Code's TUI when an account approaches its
+// weekly quota (hq-kajs / N2). Each pattern MUST contain exactly one numeric
+// capture group — that group is the percent integer.
+//
+// CALIBRATION RISK: Claude Code's exact warning text is not stable across
+// versions and was not directly observed when this set was authored — the
+// patterns below were drafted from the bead's hints + adjacent /usage and
+// near-limit text reported in upstream issues (anthropics/claude-code).
+// See hq-2h2d (N6) for the 1-week dry-run shakedown protocol before
+// enabling the soft/hard auto-stop on these defaults.
+//
+// Operator override: set AccountsConfig.UsagePatterns in mayor/accounts.json
+// (top-level field) to bypass these without rebuilding.
+var DefaultWeeklyUsagePatterns = []string{
+	`(?i)you\W?ve used\s+(\d{1,3})%\s+of\s+your\s+weekly\s+(?:limit|usage|quota)`, // "you've used 87% of your weekly limit"
+	`(?i)(\d{1,3})%\s+of\s+(?:your\s+)?weekly\s+(?:usage|limit|quota)`,            // "87% of weekly usage"
+	`(?i)weekly\s+(?:usage|limit|quota)[^%\d]{0,20}(\d{1,3})\s*%`,                 // "weekly usage: 87%"
+	`(?i)approaching\s+weekly\s+limit\D+(\d{1,3})\s*%`,                            // "approaching weekly limit (87%)"
+}
+
