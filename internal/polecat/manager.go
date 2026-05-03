@@ -47,13 +47,18 @@ const (
 	// before the next sling runs FindIdlePolecat, the same polecat gets reused
 	// for a second bead — silently dropping the first bead's bond ("whack-a-mole").
 	//
-	// The previous 3-attempt budget (~3.5s of exponential backoff) was below the
-	// observed Dolt read-visibility lag during rapid-fire dispatch, producing
-	// "issue not found" false-negatives on the SetAgentState read-back. Unifying
-	// with doltMaxRetries gives ~150s of total backoff (capped at 30s per attempt),
-	// which is far longer than typical Dolt lag but only kicks in on persistent
-	// failure — happy-path latency is unchanged.
-	doltStateRetries = doltMaxRetries
+	// We briefly unified this with doltMaxRetries (10 attempts, ~150s backoff)
+	// hypothesizing that Dolt visibility lag was the cause. Empirical testing
+	// (cp-ojup, cp-ud58 verification slings 2026-05-03 14:31–14:33) showed even
+	// 150s of retries hits "issue not found" 100% of the time — so the lag is
+	// not the actual bottleneck. The real lead is the cross-rig routing miss
+	// flagged by `no route found for prefix "gt-"` warnings; that investigation
+	// is filed separately.
+	//
+	// Reverting to 3 attempts: same budget as before A.1, preserves the warn-only
+	// outcome, avoids the 150s/sling latency tax that the longer budget imposed
+	// for zero gain in the verification tests.
+	doltStateRetries = 3
 )
 
 // doltBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
