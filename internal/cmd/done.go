@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/reconcile"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -607,6 +608,35 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
+						}
+						// hq-fv6h (N5) pre-CLOSE bead-reference verification.
+						//
+						// VerifyPushedCommit confirms the SHA exists on origin/<branch>, but
+						// not that the commit was actually produced for *this* bead. The
+						// false-CLOSED-zero-deliverable bug pattern (mayor 2026-05-03 sweep)
+						// hits when a zombie polecat's worktree is destroyed and `gt done`
+						// runs from a respawn that captures HEAD of the rig's main branch —
+						// which is some other bead's commit. VerifyPushedCommit then passes
+						// (the commit IS on origin) but the bead being closed has zero
+						// deliverable.
+						//
+						// Defense: require the commit's subject to mention this bead-id as
+						// a standalone token. Fail-open on subject-read errors so we never
+						// block a legitimate close on a transient git issue.
+						if noMRCommitSHA != "" && issueID != "" {
+							if subject, sErr := g.CommitSubject(noMRCommitSHA); sErr == nil {
+								if !reconcile.SubjectReferencesBead(subject, issueID) {
+									short := noMRCommitSHA
+									if len(short) > 8 {
+										short = short[:8]
+									}
+									return fmt.Errorf(
+										"cannot close bead %s: claimed commit %s does not reference it (subject: %q). "+
+											"This is the false-CLOSED-zero-deliverable pattern (hq-fv6h). "+
+											"Pass --skip-verify if this is intentional (e.g. cherry-picked from a different bead's branch)",
+										issueID, short, subject)
+								}
+							}
 						}
 						if noMRCommitSHA != "" {
 							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)

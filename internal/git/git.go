@@ -1537,6 +1537,18 @@ func (g *Git) Rev(ref string) (string, error) {
 	return g.run("rev-parse", ref)
 }
 
+// CommitSubject returns the first line ("subject") of the given commit's message.
+// Used by the reconciler (hq-136j N1) to verify that a commit's subject references
+// a specific bead-id — closing the false-CLOSED-zero-deliverable bug class where
+// a polecat's claimed commit_sha actually belongs to a different bead.
+func (g *Git) CommitSubject(commit string) (string, error) {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return "", fmt.Errorf("CommitSubject: empty commit")
+	}
+	return g.run("log", "-1", "--format=%s", commit)
+}
+
 // IsAncestor checks if ancestor is an ancestor of descendant.
 func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
 	_, err := g.run("merge-base", "--is-ancestor", ancestor, descendant)
