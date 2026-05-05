@@ -193,6 +193,40 @@ func GetPrefixForRig(townRoot, rigName string) string {
 	return config.GetRigPrefix(townRoot, rigName)
 }
 
+// GetAllPrefixesForRig returns every prefix (without trailing hyphen) routed
+// to the given rig in routes.jsonl, in route-file order. Returns the canonical
+// single-prefix slice (via GetPrefixForRig) when the rig has no routes — so
+// callers can always rely on a non-empty slice if the rig is configured.
+//
+// This exists because a rig can legitimately have multiple prefixes mapped
+// to it (e.g., CIPcodes has both `cp-` and `cota-`). Lookups that need to find
+// an existing bead should try each candidate prefix rather than assume the
+// first-match is correct (hq-wzy5).
+func GetAllPrefixesForRig(townRoot, rigName string) []string {
+	beadsDir := filepath.Join(townRoot, ".beads")
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil || routes == nil {
+		return []string{config.GetRigPrefix(townRoot, rigName)}
+	}
+
+	var prefixes []string
+	seen := make(map[string]bool)
+	for _, r := range routes {
+		parts := strings.SplitN(r.Path, "/", 2)
+		if len(parts) > 0 && parts[0] == rigName {
+			p := strings.TrimSuffix(r.Prefix, "-")
+			if !seen[p] {
+				prefixes = append(prefixes, p)
+				seen[p] = true
+			}
+		}
+	}
+	if len(prefixes) == 0 {
+		return []string{config.GetRigPrefix(townRoot, rigName)}
+	}
+	return prefixes
+}
+
 // CheckPrefixAvailable verifies that a prefix is not already used by a different rig.
 // The prefix should include the trailing hyphen (e.g., "gt-").
 // newPath is the path of the rig being added (e.g., "gastown" or "gastown/mayor/rig").

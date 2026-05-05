@@ -151,6 +151,15 @@ type Manager struct {
 	namePool *NamePool
 	tmux     *tmux.Tmux
 	townRoot string // Computed once at construction; used by agentBeadID for deterministic IDs
+
+	// agentBeadIDCache memoizes the resolved bead ID per polecat name. Required
+	// when a rig has multiple prefix routes (e.g. CIPcodes has both `cp-` and
+	// `cota-`): the canonical first-match prefix may not be where the existing
+	// agent bead actually lives. Resolution happens once via existence probe;
+	// subsequent calls hit the cache. Only successful resolutions are cached
+	// (a missing bead may exist later when sling creates it). See hq-wzy5.
+	agentBeadIDCache map[string]string
+	agentBeadIDMu    sync.RWMutex
 }
 
 // NewManager creates a new polecat manager.
@@ -398,9 +407,45 @@ func (m *Manager) assigneeID(name string) string {
 // The prefix is looked up from routes.jsonl to support rigs with custom prefixes.
 // Uses the town root computed at Manager construction for deterministic IDs
 // regardless of call site (gt-lph).
+//
+// When a rig has multiple prefix routes (e.g. CIPcodes maps both `cp-` and
+// `cota-` to itself), the existing bead may live under a non-first prefix.
+// First-match canonicalisation in GetPrefixForRig produces an ID that doesn't
+// resolve, causing every read/update to fail with "issue not found" (hq-wzy5).
+// To compensate, when multiple prefixes are routed to the rig, we probe each
+// candidate ID for existence and return the matching one. Successful resolutions
+// are cached for the lifetime of the Manager. If no existing bead is found, we
+// return the canonical (first-match) ID — appropriate for new bead creation.
 func (m *Manager) agentBeadID(name string) string {
-	prefix := beads.GetPrefixForRig(m.townRoot, m.rig.Name)
-	return beads.PolecatBeadIDWithPrefix(prefix, m.rig.Name, name)
+	m.agentBeadIDMu.RLock()
+	if id, ok := m.agentBeadIDCache[name]; ok {
+		m.agentBeadIDMu.RUnlock()
+		return id
+	}
+	m.agentBeadIDMu.RUnlock()
+
+	prefixes := beads.GetAllPrefixesForRig(m.townRoot, m.rig.Name)
+	canonicalID := beads.PolecatBeadIDWithPrefix(prefixes[0], m.rig.Name, name)
+	if len(prefixes) == 1 {
+		return canonicalID
+	}
+
+	// Multi-prefix rig: probe each candidate to find the existing bead.
+	for _, p := range prefixes {
+		candidateID := beads.PolecatBeadIDWithPrefix(p, m.rig.Name, name)
+		if _, err := m.beads.Show(candidateID); err == nil {
+			m.agentBeadIDMu.Lock()
+			if m.agentBeadIDCache == nil {
+				m.agentBeadIDCache = make(map[string]string)
+			}
+			m.agentBeadIDCache[name] = candidateID
+			m.agentBeadIDMu.Unlock()
+			return candidateID
+		}
+	}
+
+	// No existing bead under any prefix — return canonical for new creation.
+	return canonicalID
 }
 
 // getCleanupStatusFromBead reads the cleanup_status from the polecat's agent bead.
