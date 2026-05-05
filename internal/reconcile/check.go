@@ -155,7 +155,13 @@ type CommitFinder interface {
 //
 // The 4-hour buffer before closed_at accounts for the polecat-commits-then-closes
 // sequence (commit lands first, bd close marks it).
-func VerifyClosedBead(finder CommitFinder, beadsDir, branch, beadID, fallbackSince string) Result {
+//
+// `grace` is the minimum age of a CLOSED bead before MISSING is reportable.
+// Beads closed more recently than `grace` are skipped (returned as StatusOK with
+// a "within grace window" detail). This prevents false MISSING reports during
+// the normal merge-queue drain window between bd-CLOSE and origin/main update.
+// Pass 0 to disable.
+func VerifyClosedBead(finder CommitFinder, beadsDir, branch, beadID, fallbackSince string, grace time.Duration) Result {
 	bead, err := BeadShow(beadsDir, beadID)
 	if err != nil || bead == nil {
 		// fail-open: can't read bead state
@@ -163,9 +169,15 @@ func VerifyClosedBead(finder CommitFinder, beadsDir, branch, beadID, fallbackSin
 	}
 
 	// Compute git --since: closed_at minus 4h, falling back to fallbackSince.
+	// Also enforce grace window: if closed too recently, skip the check entirely
+	// (lets the merge queue drain before we declare MISSING).
 	since := fallbackSince
 	if bead.ClosedAt != "" {
 		if t, err := time.Parse(time.RFC3339, bead.ClosedAt); err == nil {
+			if grace > 0 && time.Since(t) < grace {
+				return Result{BeadID: beadID, Status: StatusOK,
+					Detail: fmt.Sprintf("closed %s ago, within grace window %s", time.Since(t).Round(time.Second), grace)}
+			}
 			since = t.Add(-4 * time.Hour).UTC().Format(time.RFC3339)
 		}
 	}

@@ -17,6 +17,7 @@ var (
 	reconcileSince  string
 	reconcileRepo   string
 	reconcileBranch string
+	reconcileGrace  string
 	reconcileQuiet  bool
 )
 
@@ -62,6 +63,7 @@ func init() {
 	reconcileCmd.Flags().StringVar(&reconcileSince, "since", "24h", "How far back to scan CLOSED beads (e.g. 24h, 1h, 30m)")
 	reconcileCmd.Flags().StringVar(&reconcileRepo, "repo", "", "Repo path for git lookups (auto-detected from rig)")
 	reconcileCmd.Flags().StringVar(&reconcileBranch, "branch", "origin/main", "Branch to verify CLOSED-bead commits against")
+	reconcileCmd.Flags().StringVar(&reconcileGrace, "grace", "15m", "Grace window after bead close before MISSING is reportable (lets merge queue drain). 0 to disable.")
 	reconcileCmd.Flags().BoolVar(&reconcileQuiet, "quiet", false, "Suppress per-bead OK lines (only show divergences)")
 
 	rootCmd.AddCommand(reconcileCmd)
@@ -92,14 +94,23 @@ func runReconcile(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--since: %w", err)
 	}
 
+	var grace time.Duration
+	if reconcileGrace != "" && reconcileGrace != "0" {
+		g, err := time.ParseDuration(reconcileGrace)
+		if err != nil {
+			return fmt.Errorf("--grace: %w", err)
+		}
+		grace = g
+	}
+
 	beadsDir := ""
 	if d := filepath.Join(repo, ".beads"); dirExists(d) {
 		beadsDir = d
 	}
 
 	if !reconcileQuiet {
-		fmt.Printf("=== gt-reconcile rig=%s repo=%s since=%s branch=%s ===\n",
-			rig, repo, reconcileSince, reconcileBranch)
+		fmt.Printf("=== gt-reconcile rig=%s repo=%s since=%s branch=%s grace=%s ===\n",
+			rig, repo, reconcileSince, reconcileBranch, grace)
 	}
 
 	divergences := 0
@@ -117,7 +128,7 @@ func runReconcile(cmd *cobra.Command, args []string) error {
 	}
 	finder := reconcile.GitCmdFinder{RepoDir: repo}
 	for _, beadID := range closed {
-		r := reconcile.VerifyClosedBead(finder, beadsDir, reconcileBranch, beadID, since)
+		r := reconcile.VerifyClosedBead(finder, beadsDir, reconcileBranch, beadID, since, grace)
 		if r.Divergent() {
 			fmt.Println(r.String())
 			divergences++
