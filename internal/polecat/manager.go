@@ -348,6 +348,16 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
 		_, err := m.beads.CreateOrReopenAgentBead(agentID, agentID, fields)
 		if err == nil {
+			// hq-jhqi: insert a read-after-write barrier before returning. Dolt's
+			// read-visibility lag during rapid-fire dispatch can leave the just-created
+			// bead invisible to subsequent reads (including SetAgentState's read-modify-
+			// write cycle), producing "issue not found" false-negatives. This barrier
+			// guarantees that by the time we return, the bead is visible to callers.
+			if visErr := m.waitForAgentBeadVisible(agentID); visErr != nil {
+				style.PrintWarning("agent bead %s created but did not become visible: %v", agentID, visErr)
+				// Fall through — caller's retry-on-not-found logic still applies as
+				// belt-and-suspenders. Don't fail the whole spawn over a visibility hiccup.
+			}
 			return nil
 		}
 		lastErr = err
@@ -367,6 +377,38 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 		}
 	}
 	return fmt.Errorf("creating agent bead after %d attempts: %w", doltMaxRetries, lastErr)
+}
+
+// waitForAgentBeadVisible polls beads.Show until the agent bead becomes visible
+// to subsequent reads, or the retry budget is exhausted. This is a read-after-
+// write barrier that closes the Dolt visibility-lag gap between create and
+// read-back (hq-jhqi).
+//
+// Without this barrier, callers that immediately read the bead after creation
+// — most notably SetAgentState's read-modify-write cycle — may see "issue not
+// found" until Dolt's read-replica catches up. During rapid-fire dispatch the
+// lag exceeds the SetAgentState retry budget, producing silent bond drops
+// (whack-a-mole reuse).
+//
+// Only ErrNotFound triggers a retry — other errors are real failures and are
+// returned immediately so the caller can decide.
+func (m *Manager) waitForAgentBeadVisible(agentID string) error {
+	var lastErr error
+	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
+		_, err := m.beads.Show(agentID)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			return err
+		}
+		lastErr = err
+		if attempt < doltMaxRetries {
+			time.Sleep(doltBackoff(attempt))
+		}
+	}
+	return fmt.Errorf("agent bead %s did not become visible after %d attempts: %w",
+		agentID, doltMaxRetries, lastErr)
 }
 
 // SetAgentStateWithRetry wraps SetAgentState with retry logic.
