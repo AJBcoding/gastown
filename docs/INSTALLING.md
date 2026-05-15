@@ -94,19 +94,19 @@ dolt version
 
 Homebrew installs the runtime dependencies declared by the core formula. The
 `gastownhall/gastown` tap is reserved for emergency updates. If you build from
-source instead, install `dolt` first, install `bd` with Go, and ensure
-`$GOPATH/bin` (usually `~/go/bin`) is in your PATH. On macOS, do not install
-`gt` with `go install`: unsigned binaries may be killed by the OS. Clone the
-repository and use `make` instead.
+source instead, install `dolt` first, install `bd` with Go, ensure `$GOPATH/bin`
+(usually `~/go/bin`) is in your PATH, and ensure `~/.local/bin` appears before
+older install locations. On macOS, do not install `gt` with `go install`:
+unsigned binaries may be killed by the OS. Clone the repository and use `make`
+instead.
 
 ```bash
 brew install dolt
 go install github.com/steveyegge/beads/cmd/bd@latest
-export PATH="$PATH:$HOME/go/bin"
+export PATH="$HOME/.local/bin:$PATH:$HOME/go/bin"
 git clone https://github.com/steveyegge/gastown.git
 cd gastown
-make build
-mv gt "$HOME/go/bin/"
+make install
 ```
 
 ### Step 2: Create Your Workspace
@@ -236,13 +236,16 @@ Gas Town is modular. Enable only what you need:
 
 ### `gt: command not found`
 
-Your Go bin directory is not in PATH:
+The Gas Town binary directory is not in PATH. Homebrew usually handles this for
+Homebrew installs. Source installs place `gt` in `~/.local/bin`:
 
 ```bash
 # Add to your shell config (~/.bashrc, ~/.zshrc)
-export PATH="$PATH:$HOME/go/bin"
+export PATH="$HOME/.local/bin:$PATH"
 source ~/.bashrc  # or restart terminal
 ```
+
+If you also installed Beads with Go, keep `$HOME/go/bin` in PATH for `bd`.
 
 ### `bd: command not found`
 
@@ -299,12 +302,35 @@ bd doctor                  # Run beads health check
 
 ## Updating
 
-To update Gas Town and Beads:
+Update Gas Town through the same channel you used to install it. For the
+recommended Homebrew install:
 
 ```bash
-go install github.com/steveyegge/gastown/cmd/gt@latest
-go install github.com/steveyegge/beads/cmd/bd@latest
+brew update
+brew upgrade gastown
 gt doctor --fix            # Fix any post-update issues
+```
+
+If you installed from source, update the checkout and rebuild with `make` rather
+than installing `gt` with `go install` on macOS:
+
+```bash
+git pull --ff-only
+make install
+gt doctor --fix
+```
+
+If you maintain Beads separately from Homebrew, update `bd` from its own source:
+
+```bash
+go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+After updating, verify that your shell is running the binary you intended:
+
+```bash
+command -v gt
+gt version
 ```
 
 ## Uninstalling
