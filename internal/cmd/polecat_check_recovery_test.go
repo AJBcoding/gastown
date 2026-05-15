@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
 // fakeMRFinder is a test stub for the mrFinder interface used by applyMQCheck.
@@ -156,5 +157,64 @@ func TestIsActiveMRTerminal(t *testing.T) {
 				t.Errorf("isActiveMRTerminal() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCleanupStatusBlocker(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{status: "clean", want: ""},
+		{status: "has_unpushed", want: "cleanup_status=has_unpushed"},
+		{status: "unknown", want: "cleanup_status=unknown"},
+		{status: "", want: "cleanup_status=<missing>"},
+		{status: "weird", want: "cleanup_status=weird"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			got := cleanupStatusBlocker(polecat.CleanupStatus(tt.status))
+			if got != tt.want {
+				t.Errorf("cleanupStatusBlocker(%q) = %q, want %q", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestActiveMRBlocker(t *testing.T) {
+	tests := []struct {
+		name string
+		mrID string
+		bd   issueShower
+		want string
+	}{
+		{name: "empty", want: ""},
+		{name: "closed", mrID: "mr-1", bd: fakeIssueShower{issue: &beads.Issue{ID: "mr-1", Status: "closed"}}, want: ""},
+		{name: "open", mrID: "mr-1", bd: fakeIssueShower{issue: &beads.Issue{ID: "mr-1", Status: "open"}}, want: "active_mr=mr-1 status=open"},
+		{name: "missing", mrID: "mr-1", bd: fakeIssueShower{issue: nil}, want: "active_mr=mr-1 status=missing"},
+		{name: "nil reader", mrID: "mr-1", bd: nil, want: "active_mr=mr-1 status=unverified"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := activeMRBlocker(tt.bd, tt.mrID)
+			if got != tt.want {
+				t.Errorf("activeMRBlocker() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatSafetyCheckBlockers(t *testing.T) {
+	blocked := []*SafetyCheckResult{
+		{Polecat: "gastown/fury", Reasons: []string{"cleanup_status=unknown", "active_mr=hq-wisp-1 status=open"}},
+		{Polecat: "gastown/rust", Reasons: []string{"has work on hook (gt-abc)"}},
+	}
+
+	got := formatSafetyCheckBlockers(blocked)
+	want := "gastown/fury: cleanup_status=unknown; active_mr=hq-wisp-1 status=open | gastown/rust: has work on hook (gt-abc)"
+	if got != want {
+		t.Errorf("formatSafetyCheckBlockers() = %q, want %q", got, want)
 	}
 }

@@ -1029,6 +1029,8 @@ type RecoveryStatus struct {
 	Branch        string                `json:"branch,omitempty"`
 	Issue         string                `json:"issue,omitempty"`
 	MQStatus      string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
+	ActiveMR      string                `json:"active_mr,omitempty"`
+	Blockers      []string              `json:"blockers,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1070,6 +1072,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			status.CleanupStatus = polecat.CleanupUnknown
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
+			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=unknown path=%s: %v", p.ClonePath, gitErr))
 		} else if gitState.Clean {
 			status.CleanupStatus = polecat.CleanupClean
 			status.NeedsRecovery = false
@@ -1078,19 +1081,29 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			status.CleanupStatus = polecat.CleanupUnpushed
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
+			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_unpushed unpushed_commits=%d", gitState.UnpushedCommits))
 		} else if gitState.StashCount > 0 {
 			status.CleanupStatus = polecat.CleanupStash
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
+			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_stash stash_count=%d", gitState.StashCount))
 		} else {
 			status.CleanupStatus = polecat.CleanupUncommitted
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
+			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_uncommitted uncommitted_files=%d", len(gitState.UncommittedFiles)))
 		}
 	} else {
 		// Use cleanup_status from agent bead
 		status.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
-		if status.CleanupStatus.IsSafe() && isActiveMRTerminal(bd, fields.ActiveMR) {
+		status.ActiveMR = fields.ActiveMR
+		if blocker := cleanupStatusBlocker(status.CleanupStatus); blocker != "" {
+			status.Blockers = append(status.Blockers, blocker)
+		}
+		if blocker := activeMRBlocker(bd, fields.ActiveMR); blocker != "" {
+			status.Blockers = append(status.Blockers, blocker)
+		}
+		if len(status.Blockers) == 0 {
 			status.NeedsRecovery = false
 			status.Verdict = "SAFE_TO_NUKE"
 		} else {
@@ -1135,6 +1148,9 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if status.Issue != "" {
 		fmt.Printf("  Issue:           %s\n", status.Issue)
 	}
+	if status.ActiveMR != "" {
+		fmt.Printf("  Active MR:       %s\n", status.ActiveMR)
+	}
 	fmt.Println()
 
 	switch status.Verdict {
@@ -1147,7 +1163,14 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	case "NEEDS_RECOVERY":
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
 		fmt.Println()
-		fmt.Printf("  %s This polecat has unpushed/uncommitted work.\n", style.Warning.Render("⚠"))
+		if len(status.Blockers) > 0 {
+			fmt.Printf("  %s Cleanup refused by these predicate(s):\n", style.Warning.Render("⚠"))
+			for _, blocker := range status.Blockers {
+				fmt.Printf("    - %s\n", blocker)
+			}
+		} else {
+			fmt.Printf("  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
+		}
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
 	default:
 		fmt.Printf("  Verdict:         %s\n", style.Success.Render("SAFE_TO_NUKE"))
@@ -1177,6 +1200,39 @@ func isActiveMRTerminal(bd issueShower, mrID string) bool {
 		return false
 	}
 	return beads.IssueStatus(mr.Status).IsTerminal()
+}
+
+func cleanupStatusBlocker(status polecat.CleanupStatus) string {
+	switch status {
+	case polecat.CleanupClean:
+		return ""
+	case "":
+		return "cleanup_status=<missing>"
+	case polecat.CleanupUnknown:
+		return "cleanup_status=unknown"
+	default:
+		return fmt.Sprintf("cleanup_status=%s", status)
+	}
+}
+
+func activeMRBlocker(bd issueShower, mrID string) string {
+	if mrID == "" {
+		return ""
+	}
+	if bd == nil {
+		return fmt.Sprintf("active_mr=%s status=unverified", mrID)
+	}
+	mr, err := bd.Show(mrID)
+	if err != nil {
+		return fmt.Sprintf("active_mr=%s status=lookup_error: %v", mrID, err)
+	}
+	if mr == nil {
+		return fmt.Sprintf("active_mr=%s status=missing", mrID)
+	}
+	if beads.IssueStatus(mr.Status).IsTerminal() {
+		return ""
+	}
+	return fmt.Sprintf("active_mr=%s status=%s", mrID, mr.Status)
 }
 
 // mrFinder is the subset of *beads.Beads that applyMQCheck needs. It lets us
@@ -1336,7 +1392,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 		if len(blocked) > 0 {
 			displaySafetyCheckBlocked(blocked)
-			return fmt.Errorf("blocked: %d polecat(s) have active work", len(blocked))
+			return fmt.Errorf("blocked: %d polecat(s) failed nuke safety checks: %s", len(blocked), formatSafetyCheckBlockers(blocked))
 		}
 	}
 
