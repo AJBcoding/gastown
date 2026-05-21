@@ -118,201 +118,6 @@ func TestExtractIssueID(t *testing.T) {
 	}
 }
 
-func TestSlingFormulaOnBeadRoutesBDCommandsToTargetRig(t *testing.T) {
-	townRoot := t.TempDir()
-
-	// Minimal workspace marker so workspace.FindFromCwd() succeeds.
-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
-		t.Fatalf("mkdir mayor/rig: %v", err)
-	}
-
-	// Create a rig path that owns gt-* beads, and a routes.jsonl pointing to it.
-	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
-	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
-		t.Fatalf("mkdir .beads: %v", err)
-	}
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
-		t.Fatalf("mkdir rigDir: %v", err)
-	}
-	routes := strings.Join([]string{
-		`{"prefix":"gt-","path":"gastown/mayor/rig"}`,
-		`{"prefix":"hq-","path":"."}`,
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
-		t.Fatalf("write routes.jsonl: %v", err)
-	}
-
-	// Stub bd so we can observe the working directory for cook/wisp/bond.
-	binDir := filepath.Join(townRoot, "bin")
-	if err := os.MkdirAll(binDir, 0755); err != nil {
-		t.Fatalf("mkdir binDir: %v", err)
-	}
-	logPath := filepath.Join(townRoot, "bd.log")
-	bdScript := `#!/bin/sh
-set -e
-echo "$(pwd)|${BEADS_DIR:-}|$*" >> "${BD_LOG}"
-cmd="$1"
-shift || true
-case "$cmd" in
-  show)
-    echo '[{"title":"Test issue","status":"open","assignee":"","description":""}]'
-    ;;
-  formula)
-    # formula show <name> - must output something for verifyFormulaExists
-    echo '{"name":"test-formula"}'
-    exit 0
-    ;;
-  cook)
-    exit 0
-    ;;
-  mol)
-    sub="$1"
-    shift || true
-    case "$sub" in
-      wisp)
-        echo '{"new_epic_id":"gt-wisp-xyz"}'
-        ;;
-      bond)
-        echo '{"root_id":"gt-wisp-xyz"}'
-        ;;
-    esac
-    ;;
-esac
-exit 0
-`
-	bdScriptWindows := `@echo off
-setlocal enableextensions
-echo %CD%^|%BEADS_DIR%^|%*>>"%BD_LOG%"
-set "cmd=%1"
-set "sub=%2"
-if "%cmd%"=="show" (
-  echo [{"title":"Test issue","status":"open","assignee":"","description":""}]
-  exit /b 0
-)
-if "%cmd%"=="formula" (
-  echo {"name":"test-formula"}
-  exit /b 0
-)
-if "%cmd%"=="cook" exit /b 0
-if "%cmd%"=="mol" (
-  if "%sub%"=="wisp" (
-    echo {"new_epic_id":"gt-wisp-xyz"}
-    exit /b 0
-  )
-  if "%sub%"=="bond" (
-    echo {"root_id":"gt-wisp-xyz"}
-    exit /b 0
-  )
-)
-exit /b 0
-`
-	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
-
-	t.Setenv("BD_LOG", logPath)
-	attachedLogPath := filepath.Join(townRoot, "attached-molecule.log")
-	t.Setenv("GT_TEST_ATTACHED_MOLECULE_LOG", attachedLogPath)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv(EnvGTRole, "mayor")
-	t.Setenv("GT_POLECAT", "")
-	t.Setenv("GT_CREW", "")
-	t.Setenv("TMUX_PANE", "") // Prevent inheriting real tmux pane from test runner
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(cwd) })
-	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-
-	// Ensure we don't leak global flag state across tests.
-	prevOn := slingOnTarget
-	prevVars := slingVars
-	prevDryRun := slingDryRun
-	prevNoConvoy := slingNoConvoy
-	t.Cleanup(func() {
-		slingOnTarget = prevOn
-		slingVars = prevVars
-		slingDryRun = prevDryRun
-		slingNoConvoy = prevNoConvoy
-	})
-
-	slingDryRun = false
-	slingNoConvoy = true
-	slingVars = nil
-	slingOnTarget = "gt-abc123"
-
-	// Prevent real tmux nudge from firing during tests (causes agent self-interruption)
-	t.Setenv("GT_TEST_NO_NUDGE", "1")
-	t.Setenv("GT_TEST_SKIP_HOOK_VERIFY", "1") // Stub bd doesn't track state
-
-	if err := runSling(nil, []string{"mol-review"}); err != nil {
-		t.Fatalf("runSling: %v", err)
-	}
-
-	logBytes, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("read bd log: %v", err)
-	}
-	logLines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
-
-	wantDir := rigDir
-	if resolved, err := filepath.EvalSymlinks(wantDir); err == nil {
-		wantDir = resolved
-	}
-	wantBeadsDir := filepath.Join(rigDir, ".beads")
-	if resolved, err := filepath.EvalSymlinks(wantBeadsDir); err == nil {
-		wantBeadsDir = resolved
-	}
-	gotCook := false
-	gotWisp := false
-	gotBond := false
-
-	for _, line := range logLines {
-		parts := strings.SplitN(line, "|", 3)
-		if len(parts) != 3 {
-			continue
-		}
-		dir := parts[0]
-		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-			dir = resolved
-		}
-		beadsDir := parts[1]
-		if resolved, err := filepath.EvalSymlinks(beadsDir); err == nil {
-			beadsDir = resolved
-		}
-		args := parts[2]
-
-		switch {
-		case strings.Contains(args, "cook "):
-			gotCook = true
-			// cook doesn't need database context, runs from cwd
-		case strings.Contains(args, "mol wisp "):
-			gotWisp = true
-			if dir != wantDir {
-				t.Fatalf("bd mol wisp ran in %q, want %q (args: %q)", dir, wantDir, args)
-			}
-			if beadsDir != wantBeadsDir {
-				t.Fatalf("bd mol wisp used BEADS_DIR %q, want %q (args: %q)", beadsDir, wantBeadsDir, args)
-			}
-		case strings.Contains(args, "mol bond "):
-			gotBond = true
-			if dir != wantDir {
-				t.Fatalf("bd mol bond ran in %q, want %q (args: %q)", dir, wantDir, args)
-			}
-			if beadsDir != wantBeadsDir {
-				t.Fatalf("bd mol bond used BEADS_DIR %q, want %q (args: %q)", beadsDir, wantBeadsDir, args)
-			}
-		}
-	}
-
-	if !gotCook || !gotWisp || !gotBond {
-		t.Fatalf("missing expected bd commands: cook=%v wisp=%v bond=%v (log: %q)", gotCook, gotWisp, gotBond, string(logBytes))
-	}
-}
-
 func TestSlingNewlyCreatedRigBeadRoutesBDCommandsToTargetRig(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows: shell stub redacts multiline descriptions")
@@ -493,6 +298,13 @@ exit /b 0
 		t.Fatalf("runSling: %v", err)
 	}
 
+	// Also exercise the explicit formula-on-bead path; this is the older
+	// --on-style route that must use the same target rig database.
+	slingOnTarget = newBeadID
+	if err := runSling(nil, []string{"mol-review"}); err != nil {
+		t.Fatalf("runSling --on: %v", err)
+	}
+
 	logBytes, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read bd log: %v", err)
@@ -507,9 +319,11 @@ exit /b 0
 	if resolved, err := filepath.EvalSymlinks(wantBeadsDir); err == nil {
 		wantBeadsDir = resolved
 	}
-	gotCook := false
-	gotWisp := false
-	gotBond := false
+	gotPolecatCook := false
+	gotPolecatWisp := false
+	gotReviewCook := false
+	gotReviewWisp := false
+	gotBondCount := 0
 	gotCreate := false
 	gotTargetDBCheck := false
 	gotHook := false
@@ -549,19 +363,27 @@ exit /b 0
 				t.Fatalf("target rig DB check args = %q, want --db %q", args, wantBeadsDir)
 			}
 		case strings.Contains(args, "cook "):
-			gotCook = true
-			if !strings.Contains(args, "mol-polecat-work") {
-				t.Fatalf("bd cook args = %q, want mol-polecat-work", args)
+			switch {
+			case strings.Contains(args, "mol-polecat-work"):
+				gotPolecatCook = true
+			case strings.Contains(args, "mol-review"):
+				gotReviewCook = true
+			default:
+				t.Fatalf("bd cook args = %q, want expected formula", args)
 			}
 			assertTargetRig("cook", dir, beadsDir, args)
 		case strings.Contains(args, "mol wisp "):
-			gotWisp = true
-			if !strings.Contains(args, "mol-polecat-work") {
-				t.Fatalf("bd mol wisp args = %q, want mol-polecat-work", args)
+			switch {
+			case strings.Contains(args, "mol-polecat-work"):
+				gotPolecatWisp = true
+			case strings.Contains(args, "mol-review"):
+				gotReviewWisp = true
+			default:
+				t.Fatalf("bd mol wisp args = %q, want expected formula", args)
 			}
 			assertTargetRig("mol wisp", dir, beadsDir, args)
 		case strings.Contains(args, "mol bond "):
-			gotBond = true
+			gotBondCount++
 			assertTargetRig("mol bond", dir, beadsDir, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--status=hooked"):
 			gotHook = true
@@ -572,9 +394,9 @@ exit /b 0
 		}
 	}
 
-	if !gotCreate || !gotTargetDBCheck || !gotCook || !gotWisp || !gotBond || !gotHook || !gotMetadata {
-		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v cook=%v wisp=%v bond=%v hook=%v metadata=%v (log: %q)",
-			gotCreate, gotTargetDBCheck, gotCook, gotWisp, gotBond, gotHook, gotMetadata, string(logBytes))
+	if !gotCreate || !gotTargetDBCheck || !gotPolecatCook || !gotPolecatWisp || !gotReviewCook || !gotReviewWisp || gotBondCount < 2 || !gotHook || !gotMetadata {
+		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v polecat(cook=%v wisp=%v) review(cook=%v wisp=%v) bondCount=%d hook=%v metadata=%v (log: %q)",
+			gotCreate, gotTargetDBCheck, gotPolecatCook, gotPolecatWisp, gotReviewCook, gotReviewWisp, gotBondCount, gotHook, gotMetadata, string(logBytes))
 	}
 }
 

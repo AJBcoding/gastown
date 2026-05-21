@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -317,5 +318,131 @@ func TestAttachmentFormulaVarsPrefersAttachedVars(t *testing.T) {
 	want := []string{"problem=First\n\nSecond"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("attachmentFormulaVars() = %#v, want %#v", got, want)
+	}
+}
+
+func TestFormulaConvoyIDUsesTownConvoyPrefix(t *testing.T) {
+	t.Parallel()
+
+	got := formulaConvoyID("abc123")
+	want := "hq-cv-abc123"
+	if got != want {
+		t.Fatalf("formulaConvoyID() = %q, want %q", got, want)
+	}
+}
+
+func TestExecuteConvoyFormulaCreatesTownConvoyAndRigLegs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stubs are unix-only")
+	}
+
+	townRoot := t.TempDir()
+	townBeads := filepath.Join(townRoot, ".beads")
+	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	rigBeads := filepath.Join(rigDir, ".beads")
+	for _, dir := range []string{filepath.Join(townRoot, "mayor", "rig"), townBeads, rigDir, rigBeads} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"gt-","path":"gastown/mayor/rig"}`,
+		`{"prefix":"hq-","path":"."}`,
+		`{"prefix":"hq-cv-","path":"."}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routes), 0o644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+set -e
+printf '%s|%s|%s\n' "$(pwd)" "${BEADS_DIR:-}" "$*" >> "${BD_LOG}"
+exit 0
+`
+	_ = writeBDStub(t, binDir, bdScript, "")
+	gtPath := filepath.Join(binDir, "gt")
+	gtScript := `#!/bin/sh
+set -e
+printf 'gt|%s|%s\n' "$(pwd)" "$*" >> "${GT_LOG}"
+exit 0
+`
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write gt stub: %v", err)
+	}
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("GT_LOG", filepath.Join(townRoot, "gt.log"))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BEADS_DIR", filepath.Join(townRoot, "wrong", ".beads"))
+
+	oldAddTracking := addTrackingRelationFn
+	oldPR := formulaRunPR
+	oldSet := formulaRunSet
+	oldFiles := formulaRunFiles
+	oldAgent := formulaRunAgent
+	t.Cleanup(func() {
+		addTrackingRelationFn = oldAddTracking
+		formulaRunPR = oldPR
+		formulaRunSet = oldSet
+		formulaRunFiles = oldFiles
+		formulaRunAgent = oldAgent
+	})
+	var trackedTownRoot, trackedConvoyID, trackedIssueID string
+	addTrackingRelationFn = func(townRootArg, convoyID, issueID string) error {
+		trackedTownRoot = townRootArg
+		trackedConvoyID = convoyID
+		trackedIssueID = issueID
+		return nil
+	}
+	formulaRunPR = 0
+	formulaRunSet = nil
+	formulaRunFiles = nil
+	formulaRunAgent = ""
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	f := &formula.Formula{
+		Description: "routing convoy",
+		Legs: []formula.Leg{{
+			ID:          "one",
+			Title:       "Leg one",
+			Description: "Do one thing",
+		}},
+	}
+	if err := executeConvoyFormula(f, "routing-fan", "gastown"); err != nil {
+		t.Fatalf("executeConvoyFormula: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	logText := string(logBytes)
+	if strings.Contains(logText, "--id=gt-cv-") {
+		t.Fatalf("formula convoy created rig-prefixed convoy in town log:\n%s", logText)
+	}
+	if !strings.Contains(logText, townBeads+"|"+townBeads+"|create ") || !strings.Contains(logText, "--id=hq-cv-") {
+		t.Fatalf("formula convoy create did not target town beads with hq-cv id:\n%s", logText)
+	}
+	if !strings.Contains(logText, rigBeads+"|"+rigBeads+"|create ") || !strings.Contains(logText, "--id=gt-leg-") {
+		t.Fatalf("formula leg create did not target rig beads with gt-leg id:\n%s", logText)
+	}
+	if trackedTownRoot != townRoot {
+		t.Fatalf("tracking townRoot = %q, want %q", trackedTownRoot, townRoot)
+	}
+	if !strings.HasPrefix(trackedConvoyID, "hq-cv-") || !strings.HasPrefix(trackedIssueID, "gt-leg-") {
+		t.Fatalf("tracking relation = (%q, %q), want hq-cv to gt-leg", trackedConvoyID, trackedIssueID)
 	}
 }
