@@ -72,7 +72,7 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 		return addGTDerivedDoltTargetEnv(env)
 	}
 	env = append(env, "BEADS_DIR="+beadsDir)
-	env = append(env, doltTargetEnvFromBeadsDir(beadsDir, true)...)
+	env = append(env, doltTargetEnvFromBeadsDir(beadsDir)...)
 	return addGTDerivedDoltTargetEnv(env)
 }
 
@@ -81,7 +81,7 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 // connection host/port from fallbackBeadsDir so routing can choose the database.
 func BuildRoutingBDEnv(base []string, fallbackBeadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
-	env = append(env, doltTargetEnvFromBeadsDir(fallbackBeadsDir, false)...)
+	env = append(env, doltTargetEnvFromBeadsDir(fallbackBeadsDir)...)
 	return addGTDerivedDoltTargetEnv(env)
 }
 
@@ -187,12 +187,15 @@ func forceBDMutation(env []string) []string {
 	return append(env, "BD_DOLT_AUTO_COMMIT=on")
 }
 
-func doltTargetEnvFromBeadsDir(beadsDir string, includeDatabase bool) []string {
+func doltTargetEnvFromBeadsDir(beadsDir string) []string {
 	if beadsDir == "" {
 		return nil
 	}
 	meta := readDoltMetadata(beadsDir)
 	var env []string
+	if townRoot := FindTownRoot(filepath.Dir(beadsDir)); townRoot != "" {
+		env = append(env, "BEADS_DOLT_DATA_DIR="+filepath.Join(townRoot, ".dolt-data"))
+	}
 	if meta.Host != "" {
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+meta.Host)
 	}
@@ -204,9 +207,8 @@ func doltTargetEnvFromBeadsDir(beadsDir string, includeDatabase bool) []string {
 }
 
 type doltMetadata struct {
-	Database string
-	Host     string
-	Port     string
+	Host string
+	Port string
 }
 
 func readDoltMetadata(beadsDir string) doltMetadata {
@@ -219,14 +221,12 @@ func readDoltMetadata(beadsDir string) doltMetadata {
 		return meta
 	}
 	var raw struct {
-		DoltDatabase   string `json:"dolt_database"`
 		DoltServerHost string `json:"dolt_server_host"`
 		DoltServerPort int    `json:"dolt_server_port"`
 	}
 	if json.Unmarshal(data, &raw) != nil {
 		return meta
 	}
-	meta.Database = strings.TrimSpace(raw.DoltDatabase)
 	meta.Host = strings.TrimSpace(raw.DoltServerHost)
 	if meta.Port == "" && raw.DoltServerPort > 0 {
 		meta.Port = strconv.Itoa(raw.DoltServerPort)
@@ -249,7 +249,6 @@ func stripEnvKey(env []string, key string) []string {
 func addGTDerivedDoltTargetEnv(env []string) []string {
 	gtHost := envValue(env, "GT_DOLT_HOST")
 	gtPort := envValue(env, "GT_DOLT_PORT")
-	gtData := envValue(env, "GT_DOLT_DATA")
 	if gtHost != "" && envValue(env, "BEADS_DOLT_SERVER_HOST") == "" {
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+gtHost)
 	}
@@ -260,9 +259,6 @@ func addGTDerivedDoltTargetEnv(env []string) []string {
 		if envValue(env, "BEADS_DOLT_PORT") == "" {
 			env = append(env, "BEADS_DOLT_PORT="+gtPort)
 		}
-	}
-	if gtData != "" && envValue(env, "BEADS_DOLT_DATA_DIR") == "" {
-		env = append(env, "BEADS_DOLT_DATA_DIR="+gtData)
 	}
 	return env
 }

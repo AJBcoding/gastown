@@ -164,26 +164,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			return getReadySlingContexts(townRoot)
 		},
 		Validate: func(b capacity.PendingBead) error {
-			// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does
-			// not match the target rig's registered prefix must not be
-			// dispatched — the polecat would land in a rig DB that cannot
-			// resolve the bead and hang in prime.
-			if b.TargetRig == "" {
-				return nil
-			}
-			rigPath := filepath.Join(townRoot, b.TargetRig)
-			rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
-			if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
-				return nil
-			}
-			gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
-			fmt.Fprintf(os.Stderr,
-				"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
-				style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
-			if shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
-				fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
-			}
-			return capacity.ErrCrossRigPrefix
+			return validatePendingBeadForDispatch(townRoot, b, true)
 		},
 		Execute: func(b capacity.PendingBead) error {
 			result, err := dispatchSingleBead(b, townRoot, actor)
@@ -598,13 +579,11 @@ func validateDryRunDispatchPlan(townRoot string, cycle *capacity.DispatchCycle, 
 	}
 	validated := make([]capacity.PendingBead, 0, len(plan.ToDispatch))
 	for _, b := range plan.ToDispatch {
-		if cycle.Validate != nil {
-			if err := cycle.Validate(b); err != nil {
-				fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=validation bead=%s target_rig=%s: %v\n",
-					style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
-				plan.Skipped++
-				continue
-			}
+		if err := validatePendingBeadForDispatch(townRoot, b, false); err != nil {
+			fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=validation bead=%s target_rig=%s: %v\n",
+				style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
+			plan.Skipped++
+			continue
 		}
 		if _, err := getBeadInfoFromTownRoot(townRoot, b.WorkBeadID); err != nil {
 			fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=bead_lookup bead=%s target_rig=%s: %v\n",
@@ -627,6 +606,28 @@ func validateDryRunDispatchPlan(townRoot string, cycle *capacity.DispatchCycle, 
 		plan.Reason = "validation"
 	}
 	return plan
+}
+
+func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
+	// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does not match the
+	// target rig's registered prefix must not be dispatched — the polecat would
+	// land in a rig DB that cannot resolve the bead and hang in prime.
+	if b.TargetRig == "" {
+		return nil
+	}
+	rigPath := filepath.Join(townRoot, b.TargetRig)
+	rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
+	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
+		return nil
+	}
+	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
+	fmt.Fprintf(os.Stderr,
+		"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
+		style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
+	if escalate && shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
+		fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
+	}
+	return capacity.ErrCrossRigPrefix
 }
 
 // isDaemonDispatch returns true when dispatch is triggered by the daemon heartbeat.

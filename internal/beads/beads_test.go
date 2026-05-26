@@ -3944,6 +3944,7 @@ printf 'unknown\n'
 	}
 	log := string(data)
 	for _, forbidden := range []string{
+		"BEADS_DOLT_DATA_DIR=/home/coder/gt/.dolt-data",
 		"BEADS_DOLT_HOST=127.0.0.1",
 		"BEADS_DOLT_SERVER_DATABASE=hq",
 	} {
