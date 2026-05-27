@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.2.0] - 2026-05-27
 
+### Added
+
+- **Scheduler capacity visibility** — Scheduler reporting now separates
+  working, recovery, reusable-idle, pending-MR, reservation, and free capacity
+  buckets so operators can tell whether apparent fullness is real load,
+  recovery work, or reusable idle inventory.
+- **Polecat startup detection** — Witness lifecycle checks can detect polecats
+  that never produce a startup heartbeat, improving recovery for sessions that
+  die before normal work tracking begins.
+- **Per-bead cleanup hooks** — Daemon support for per-bead cargo target cleanup
+  gives long-running workspaces a narrower cleanup path after individual task
+  execution.
+
+### Changed
+
+- **Dolt 2.0.7 baseline** — Gas Town now requires Dolt `2.0.7+`, pins CI,
+  nightly, Docker, and testcontainer paths to `2.0.7`, and validates the Dolt
+  binary before beads-enabled install and doctor flows. This prevents mixed
+  1.x/2.x clients from writing shared Dolt stores with incompatible behavior.
+- **Release publishing hardening** — The npm release workflow now age-gates its
+  npm self-update before publishing with provenance, reducing release risk from
+  freshly published npm CLI versions.
+- **Autonomous-agent UX** — Autonomous agents no longer receive human-facing
+  satisfaction prompts or away recaps, reducing irrelevant context churn during
+  unattended operation.
+
 ### Fixed
 
 - **Daemon crash-loop vs Claude usage limits** — Stuck-agent-dog now inspects
@@ -25,7 +51,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the canonical DB — a silent data split. Cleanup now removes both
   naming forms and `AddRig` fails loudly if an orphan persists (gh#3562,
   hq-j6hur.4.2).
-- **Stale hooked mail beads** — `sendHandoffMail()` now closes any `gt:message` beads left in `status=hooked` from previous sessions before creating a new handoff bead, preventing indefinite accumulation across sessions (#3859).
+- **Scheduler latency and hook visibility** — Scheduler status, list, and run
+  paths avoid repeated expensive recovery classification, and hook verification
+  now uses the town root so scheduler visibility checks do not drift across
+  nested workspaces.
+- **Polecat admission and reuse safety** — Polecat capacity admission is
+  enforced across platforms, reuse decisions account for active or pending MRs,
+  and recovery classification preserves real local work while avoiding false
+  recovery blocks for terminal, submitted, idle, or pending-MR lanes.
+- **Polecat cleanup guardrails** — `gt polecat nuke` dry-runs fail closed for
+  dirty, unknown, or unsafe lanes unless `--force` is explicit, and force now
+  really bypasses the MR verdict check only when requested.
+- **Recovery false positives** — Recovery logic now tolerates reaped active MRs,
+  blocks unsafe recovery on rename-conflict dirt, and marks live no-issue
+  polecats for review instead of silently reusing ambiguous sessions.
+- **Dolt subprocess pressure** — `bd` and Dolt subprocesses now have tighter
+  timeout diagnostics, process-group kill reporting, read-only auto-commit
+  isolation, startup-path reductions, and throttling to reduce subprocess
+  storms under daemon, status-line, convoy, and hook workloads.
+- **Managed Dolt server behavior** — Managed server configuration disables
+  expensive Dolt stats, sets server time zone to UTC, refreshes PID state from
+  discovered live servers, and reports live metadata instead of relying on
+  stale legacy pidfiles.
+- **Dolt and beads routing isolation** — Bead creation, agent lifecycle writes,
+  doctor prefix checks, rig prefix seeding, and route mutations now use the
+  intended town/rig database and sanitized environment instead of leaking
+  polluted `bd` or prefix-routing state across databases.
+- **Cross-database sling safety** — Sling target validation rejects
+  cross-database targets, validates resolved polecat targets, routes standalone
+  formula work from the current workspace, and keeps formula convoys town-scoped.
+- **`gt done` and refinery handoff** — `gt done` preserves explicit targets,
+  avoids spurious refinery nudges on `DEFERRED`, closes workflow step beads on
+  deferred exit, clears hooks reliably, and auto-rebases polecat branches before
+  push when needed.
+- **Refinery and merge cleanup** — No-merge completions close correctly,
+  post-merge remote branch deletion errors are surfaced, and consolidation
+  handler TOML escaping plus stray conflict-marker cleanup were repaired.
+- **Agent startup and provider config** — Claude autonomous settings are seeded,
+  OpenCode startup and LSP defaults are restored, OpenCode compound role display
+  is preserved, Gemini context is provisioned for rig worktrees, and inherited
+  slash commands are not duplicated.
+- **Dashboard and web flows** — Ready work rows are slingable by the displayed
+  ID, duplicate ready sling submissions are blocked, dashboard rig and polecat
+  panels populate from the correct sources, and convoy fetch retry behavior is
+  serialized.
+- **Stale hooked mail beads** — `sendHandoffMail()` now closes any `gt:message`
+  beads left in `status=hooked` from previous sessions before creating a new
+  handoff bead, preventing indefinite accumulation across sessions (#3859).
+- **Boot, hook, and daemon cleanup** — Boot spawns are suppressed when the
+  Deacon is healthy, legacy tmux sockets are cleaned on startup, nudge panes
+  are validated before use, daemon-start PATH includes user bin directories,
+  and `BD_ACTOR=daemon` no longer leaks into polecat sessions.
+- **Test and production isolation** — Dolt safety regressions, formula JSON
+  parsing, repo-wide stash visibility, startup setup, and state predicates now
+  have focused coverage, while several tests and sling guards were isolated
+  from production mail, nudge, and Dolt systems.
 
 ## [1.1.0] - 2026-05-06
 
