@@ -603,7 +603,15 @@ func (d *Daemon) compactorCleanup(db *sql.DB, dbName string) {
 func (d *Daemon) compactorOpenDB(dbName string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
 		"127.0.0.1", d.doltServerPort(), dbName)
-	return sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Dolt's wait_timeout isn't reliably enforced — force the client to recycle
+	// idle connections so daemon scan cycles don't accumulate leaked connections.
+	db.SetConnMaxIdleTime(30 * time.Second)
+	db.SetConnMaxLifetime(2 * time.Minute)
+	return db, nil
 }
 
 // compactorGetHead returns the current HEAD commit hash of the main branch.

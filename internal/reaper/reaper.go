@@ -216,7 +216,16 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 		host, port, dbName,
 		fmt.Sprintf("%ds", int(readTimeout.Seconds())),
 		fmt.Sprintf("%ds", int(writeTimeout.Seconds())))
-	return sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Dolt's wait_timeout isn't reliably enforced — force the client to recycle
+	// idle connections so daemon scan cycles don't accumulate hundreds of leaked
+	// sleeping connections against the shared Dolt server.
+	db.SetConnMaxIdleTime(30 * time.Second)
+	db.SetConnMaxLifetime(2 * time.Minute)
+	return db, nil
 }
 
 // parentExcludeJoin returns a LEFT JOIN clause and WHERE condition that restricts
