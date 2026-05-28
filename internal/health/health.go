@@ -39,6 +39,11 @@ func LatencyCheck(host string, port int, timeout time.Duration) (time.Duration, 
 	if err != nil {
 		return 0, fmt.Errorf("open connection: %w", err)
 	}
+	// Recycle connections quickly — Dolt's wait_timeout isn't enforced, and the
+	// daemon calls this every 30s, so without recycling the pool leaks ~120/hr.
+	db.SetConnMaxIdleTime(15 * time.Second)
+	db.SetConnMaxLifetime(1 * time.Minute)
+	db.SetMaxIdleConns(1)
 	defer db.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -59,6 +64,9 @@ func DatabaseCount(host string, port int) (int, []string, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	db.SetConnMaxIdleTime(15 * time.Second)
+	db.SetConnMaxLifetime(1 * time.Minute)
+	db.SetMaxIdleConns(1)
 	defer db.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
