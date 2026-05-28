@@ -68,9 +68,10 @@ func TestGetTrackedIssues_FallsBackToShowTrackedDependencies(t *testing.T) {
 	scriptBody := fmt.Sprintf(`
 case "$*" in
   "--allow-stale version")
+    echo 'bd test'
     exit 0
     ;;
-  "dep list hq-cv-ext --direction=down --type=tracks --allow-stale --json")
+  "--allow-stale dep list hq-cv-ext --direction=down --type=tracks --json"|"dep list hq-cv-ext --direction=down --type=tracks --json")
     echo '[]'
     ;;
   "show hq-cv-ext --json")
@@ -137,6 +138,7 @@ func TestGetTrackedIssues_UnknownStatusForUnreachableCrossRig(t *testing.T) {
 	scriptBody := `
 case "$*" in
   "--allow-stale version")
+    echo 'bd test'
     exit 0
     ;;
   *sql*dependencies*)

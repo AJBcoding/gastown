@@ -2174,10 +2174,10 @@ esac
 	if strings.Contains(logOutput, "env="+rigBeadsDir) {
 		t.Fatalf("manager agent lifecycle used rig BEADS_DIR; log:\n%s", logOutput)
 	}
-	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " create") {
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, "create --json --id=gt-gastown-polecat-rust") {
 		t.Fatalf("manager create did not use town BEADS_DIR; log:\n%s", logOutput)
 	}
-	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " show") || !strings.Contains(logOutput, " update") {
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, "show gt-gastown-polecat-rust") || !strings.Contains(logOutput, "update gt-gastown-polecat-rust") {
 		t.Fatalf("manager reset did not use town BEADS_DIR for show/update; log:\n%s", logOutput)
 	}
 }

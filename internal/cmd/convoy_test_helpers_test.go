@@ -210,6 +210,13 @@ func (d *testDAG) BdStubScript() string {
 
 	var sb strings.Builder
 	sb.WriteString("#!/bin/sh\n")
+	sb.WriteString("if [ \"$*\" = \"--allow-stale version\" ]; then\n")
+	sb.WriteString("  echo 'bd test'\n")
+	sb.WriteString("  exit 0\n")
+	sb.WriteString("fi\n")
+	sb.WriteString("if [ \"$1\" = \"--allow-stale\" ]; then\n")
+	sb.WriteString("  shift\n")
+	sb.WriteString("fi\n")
 	sb.WriteString(`echo "CMD:$*" >> "LOGPATH"` + "\n")
 	sb.WriteString("\n")
 
@@ -304,7 +311,7 @@ func (d *testDAG) BdStubScript() string {
 	sb.WriteString(fmt.Sprintf("    echo '%s'\n", convoyListJSON))
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
-	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --all|list\\ --json\\ --limit=0\\ --status=*)\n")
+	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --all*|list\\ --json\\ --limit=0\\ --status=*)\n")
 	sb.WriteString("    echo '[]'\n")
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
