@@ -1115,6 +1115,43 @@ func (m *DoltServerManager) LastWarnings() []string {
 	return m.lastWarnings
 }
 
+// ReapIdleConnections kills Sleep-state connections older than 60 seconds.
+//
+// Dolt does not reliably enforce its own wait_timeout/interactive_timeout server
+// variables, so idle connections accumulate (~250/hour) until admission control
+// blocks new polecat spawns. We periodically clean them up here as a workaround.
+// Non-fatal: errors are logged but do not propagate.
+func (m *DoltServerManager) ReapIdleConnections() int {
+	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
+	defer cancel()
+	cmd := m.buildDoltSQLCmd(ctx,
+		"-r", "csv",
+		"-q", "SELECT id FROM information_schema.PROCESSLIST WHERE command='Sleep' AND time > 60",
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	killed := 0
+	for i, line := range lines {
+		if i == 0 || line == "" || line == "id" {
+			continue
+		}
+		id := strings.TrimSpace(line)
+		if id == "" {
+			continue
+		}
+		killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		killCmd := m.buildDoltSQLCmd(killCtx, "-q", "KILL "+id)
+		if killErr := killCmd.Run(); killErr == nil {
+			killed++
+		}
+		killCancel()
+	}
+	return killed
+}
+
 // checkConnectionCount queries the connection count and returns a warning if approaching the limit.
 // Non-fatal: failures return empty string.
 func (m *DoltServerManager) checkConnectionCount() string {

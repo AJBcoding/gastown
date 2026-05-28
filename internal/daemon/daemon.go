@@ -728,6 +728,11 @@ func (d *Daemon) Run() (err error) {
 			// of the 3-minute general heartbeat.
 			if !d.isShutdownInProgress() {
 				d.ensureDoltServerRunning()
+				if d.doltServer != nil && d.doltServer.IsEnabled() {
+					if killed := d.doltServer.ReapIdleConnections(); killed > 0 {
+						d.logger.Printf("Dolt: reaped %d idle connections (Dolt timeout not enforced)", killed)
+					}
+				}
 			}
 
 		case <-doltRemotesChan:
