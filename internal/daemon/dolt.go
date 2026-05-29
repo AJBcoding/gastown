@@ -1116,7 +1116,7 @@ func (m *DoltServerManager) LastWarnings() []string {
 }
 
 // ReapIdleConnections kills Sleep-state connections older than 60 seconds
-// AND running-state queries older than 30 seconds.
+// AND running-state queries older than 15 seconds.
 //
 // Dolt does not reliably enforce its own wait_timeout/interactive_timeout server
 // variables, so idle connections accumulate (~250/hour) until admission control
@@ -1124,35 +1124,52 @@ func (m *DoltServerManager) LastWarnings() []string {
 // LEFT JOIN patterns) stack up under concurrent agent load and eventually time
 // out client-side but keep running server-side, blocking the issues table.
 // We clean both up here as workarounds. Non-fatal: errors are not propagated.
+//
+// Batches kills into a single multi-statement subprocess invocation because
+// pile-ups can produce hundreds of victims per cycle, and spawning a separate
+// dolt sql-client per KILL is too slow to keep up.
 func (m *DoltServerManager) ReapIdleConnections() int {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 	cmd := m.buildDoltSQLCmd(ctx,
 		"-r", "csv",
-		"-q", "SELECT id FROM information_schema.PROCESSLIST WHERE (command='Sleep' AND time > 60) OR (state='running' AND time > 30)",
+		"-q", "SELECT id FROM information_schema.PROCESSLIST WHERE (command='Sleep' AND time > 60) OR (state='running' AND time > 15)",
 	)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0
 	}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	killed := 0
+	var ids []string
 	for i, line := range lines {
 		if i == 0 || line == "" || line == "id" {
 			continue
 		}
 		id := strings.TrimSpace(line)
-		if id == "" {
-			continue
+		if id != "" {
+			ids = append(ids, id)
 		}
-		killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		killCmd := m.buildDoltSQLCmd(killCtx, "-q", "KILL "+id)
-		if killErr := killCmd.Run(); killErr == nil {
-			killed++
-		}
-		killCancel()
 	}
-	return killed
+	if len(ids) == 0 {
+		return 0
+	}
+	// Batch the kills into a single subprocess. Dolt supports multi-statement
+	// scripts when separated by semicolons.
+	var sb strings.Builder
+	for _, id := range ids {
+		sb.WriteString("KILL ")
+		sb.WriteString(id)
+		sb.WriteString(";")
+	}
+	killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer killCancel()
+	killCmd := m.buildDoltSQLCmd(killCtx, "-q", sb.String())
+	if killErr := killCmd.Run(); killErr != nil {
+		// Even with batch failure, some kills may have executed before the error.
+		// Return the count we attempted so the caller logs visibility.
+		return len(ids)
+	}
+	return len(ids)
 }
 
 // checkConnectionCount queries the connection count and returns a warning if approaching the limit.
