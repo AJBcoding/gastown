@@ -1115,18 +1115,21 @@ func (m *DoltServerManager) LastWarnings() []string {
 	return m.lastWarnings
 }
 
-// ReapIdleConnections kills Sleep-state connections older than 60 seconds.
+// ReapIdleConnections kills Sleep-state connections older than 60 seconds
+// AND running-state queries older than 30 seconds.
 //
 // Dolt does not reliably enforce its own wait_timeout/interactive_timeout server
 // variables, so idle connections accumulate (~250/hour) until admission control
-// blocks new polecat spawns. We periodically clean them up here as a workaround.
-// Non-fatal: errors are logged but do not propagate.
+// blocks new polecat spawns. Separately, slow bd queries (beads v1.0.4's heavier
+// LEFT JOIN patterns) stack up under concurrent agent load and eventually time
+// out client-side but keep running server-side, blocking the issues table.
+// We clean both up here as workarounds. Non-fatal: errors are not propagated.
 func (m *DoltServerManager) ReapIdleConnections() int {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 	cmd := m.buildDoltSQLCmd(ctx,
 		"-r", "csv",
-		"-q", "SELECT id FROM information_schema.PROCESSLIST WHERE command='Sleep' AND time > 60",
+		"-q", "SELECT id FROM information_schema.PROCESSLIST WHERE (command='Sleep' AND time > 60) OR (state='running' AND time > 30)",
 	)
 	output, err := cmd.Output()
 	if err != nil {
