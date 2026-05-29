@@ -525,7 +525,11 @@ func (b *Beads) Init(prefix string) error {
 // Investigation: dc-1pq8 (forensic report 2026-05-02).
 const bdSubprocessTimeout = 60 * time.Second
 
-const bdReadThrottleTimeout = 5 * time.Second
+// bdReadThrottleTimeout bounds how long a waiter blocks for the bd list
+// throttle. With beads v1.0.4's heavier query patterns, gt status and other
+// bd list callers can take 5–10s under load; a short timeout produces cascading
+// sling/patrol failures even though the system is healthy, just busy.
+const bdReadThrottleTimeout = 30 * time.Second
 
 // resolveBdSubprocessTimeout returns the configured timeout, honoring the
 // GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
