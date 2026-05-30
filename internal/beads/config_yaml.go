@@ -26,6 +26,14 @@ func EnsureConfigYAMLFromMetadataIfMissing(beadsDir, fallbackPrefix string) erro
 	return ensureConfigYAML(beadsDir, prefix, true)
 }
 
+// ConfigYAMLIsGitTracked reports whether config.yaml is tracked by the Git
+// worktree that contains beadsDir. Callers that operate on user-owned .beads
+// directories use this to avoid rewriting project config as a side effect of
+// server-side database setup.
+func ConfigYAMLIsGitTracked(beadsDir string) bool {
+	return gitTracksFile(filepath.Dir(beadsDir), filepath.Join(beadsDir, "config.yaml"))
+}
+
 // ConfigDefaultsFromMetadata derives config.yaml defaults from metadata.json.
 // Falls back to fallbackPrefix when fields are absent.
 func ConfigDefaultsFromMetadata(beadsDir, fallbackPrefix string) string {
@@ -94,6 +102,24 @@ func ConfigYAMLDisablesAutoExport(content string) bool {
 			value := strings.TrimSpace(strings.TrimPrefix(trimmed, "export.auto:"))
 			value = strings.Trim(value, `"'`)
 			return strings.EqualFold(value, "false")
+		}
+	}
+	return false
+}
+
+func configYAMLHasSyncRemote(beadsDir string) bool {
+	data, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "sync.remote:") {
+			value := strings.TrimSpace(strings.TrimPrefix(trimmed, "sync.remote:"))
+			return strings.Trim(value, `"'`) != ""
 		}
 	}
 	return false

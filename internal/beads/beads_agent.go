@@ -219,10 +219,11 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	targetDir := target.getResolvedBeadsDir()
 
 	// Ensure target database has custom types configured.
-	// This is cached (sentinel file + in-memory) so repeated calls are fast.
-	// On fresh rigs, this may fail if the database can't be initialized.
-	// Don't bail out — try the bd create calls anyway (GH#1769).
-	_ = EnsureCustomTypes(targetDir)
+	// This also initializes and migrates the target schema before the config
+	// writes, and is cached (sentinel file + in-memory) so repeated calls are fast.
+	if err := EnsureCustomTypes(targetDir); err != nil {
+		return nil, fmt.Errorf("configuring target custom issue types: %w", err)
+	}
 
 	description := FormatAgentDescription(title, fields)
 

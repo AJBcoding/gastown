@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1347,6 +1348,47 @@ func TestResolveAgentConfigWithOverride(t *testing.T) {
 	})
 }
 
+func TestResolveAgentConfigUsesCustomClaudeWhenDefaultAgentUnset(t *testing.T) {
+	ResetRegistryForTesting()
+	t.Cleanup(ResetRegistryForTesting)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := &TownSettings{
+		Type:    "town-settings",
+		Version: CurrentTownSettingsVersion,
+		Agents: map[string]*RuntimeConfig{
+			"claude": {
+				Command: "/opt/bin/custom-claude",
+				Args:    []string{"--wrapped"},
+			},
+		},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	rc := ResolveAgentConfig(townRoot, rigPath)
+	if rc.Command != "/opt/bin/custom-claude" {
+		t.Fatalf("ResolveAgentConfig command = %q, want custom claude", rc.Command)
+	}
+	if rc.ResolvedAgent != "claude" {
+		t.Fatalf("ResolveAgentConfig ResolvedAgent = %q, want claude", rc.ResolvedAgent)
+	}
+
+	rc, name, err := ResolveAgentConfigWithOverride(townRoot, rigPath, "")
+	if err != nil {
+		t.Fatalf("ResolveAgentConfigWithOverride: %v", err)
+	}
+	if name != "claude" {
+		t.Fatalf("ResolveAgentConfigWithOverride name = %q, want claude", name)
+	}
+	if rc.Command != "/opt/bin/custom-claude" {
+		t.Fatalf("ResolveAgentConfigWithOverride command = %q, want custom claude", rc.Command)
+	}
+}
+
 func TestBuildPolecatStartupCommandWithAgentOverride(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()
@@ -1810,6 +1852,24 @@ func TestResolveRoleAgentConfigFallsBackToDefaults(t *testing.T) {
 	rc := ResolveRoleAgentConfig("polecat", "/nonexistent/town", "/nonexistent/rig")
 	if !isClaudeCommand(rc.Command) {
 		t.Errorf("Command = %q, want claude or path ending in /claude (default)", rc.Command)
+	}
+}
+
+func TestResolveRoleAgentConfigFallbackUsesCanonicalClaude(t *testing.T) {
+	ResetRegistryForTesting()
+	t.Cleanup(ResetRegistryForTesting)
+	RegisterAgentForTesting("claude", AgentPresetInfo{
+		Name:    "claude",
+		Command: "env",
+		Args:    []string{"FOO=bar", "claude"},
+	})
+
+	rc := ResolveRoleAgentConfig("polecat", "/nonexistent/town", "/nonexistent/rig")
+	if !isClaudeCommand(rc.Command) {
+		t.Fatalf("Command = %q, want canonical Claude default", rc.Command)
+	}
+	if slices.Contains(rc.Args, "FOO=bar") {
+		t.Fatalf("fallback used shadowed registry args: %v", rc.Args)
 	}
 }
 

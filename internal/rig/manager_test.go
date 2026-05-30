@@ -740,6 +740,14 @@ exit 0
 	if !strings.Contains(cmds, "config set issue_prefix myrig") {
 		t.Errorf("expected 'bd config set issue_prefix myrig' in commands log, got:\n%s", cmds)
 	}
+	migrateIndex := strings.Index(cmds, "migrate --yes")
+	prefixIndex := strings.Index(cmds, "config set issue_prefix myrig")
+	if migrateIndex == -1 {
+		t.Fatalf("expected 'bd migrate --yes' before config writes, got:\n%s", cmds)
+	}
+	if prefixIndex != -1 && migrateIndex > prefixIndex {
+		t.Fatalf("bd migrate --yes ran after config write:\n%s", cmds)
+	}
 }
 
 func TestInitBeadsPassesCanonicalDatabase(t *testing.T) {
@@ -838,10 +846,12 @@ case "$cmd" in
     # Accept slot commands
     ;;
   config)
-    # Accept config commands (e.g., "bd config set types.custom ...")
+    if [[ "$*" == *"get types.custom"* ]]; then
+      echo "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+    fi
     ;;
-  init)
-    # Accept init commands (e.g., "bd init --prefix gt --server")
+  init|migrate)
+    # Accept init and schema migration commands.
     ;;
   *)
     echo "unexpected command: $cmd" >&2
@@ -849,7 +859,7 @@ case "$cmd" in
     ;;
 esac
 `
-	windowsScript := "@echo off\r\nsetlocal enabledelayedexpansion\r\nif defined BEADS_DIR_LOG (\r\n  if defined BEADS_DIR (\r\n    echo %BEADS_DIR%>>\"%BEADS_DIR_LOG%\"\r\n  ) else (\r\n    echo ^<unset^> >>\"%BEADS_DIR_LOG%\"\r\n  )\r\n)\r\nset \"cmd=%1\"\r\nset \"arg2=%2\"\r\nset \"arg3=%3\"\r\nif \"%cmd%\"==\"--allow-stale\" (\r\n  set \"cmd=%2\"\r\n  set \"arg2=%3\"\r\n  set \"arg3=%4\"\r\n)\r\nif \"%cmd%\"==\"show\" (\r\n  echo []\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"create\" (\r\n  set \"id=\"\r\n  set \"title=\"\r\n  for %%A in (%*) do (\r\n    set \"arg=%%~A\"\r\n    if /i \"!arg:~0,5!\"==\"--id=\" set \"id=!arg:~5!\"\r\n    if /i \"!arg:~0,8!\"==\"--title=\" set \"title=!arg:~8!\"\r\n  )\r\n  if defined AGENT_LOG (\r\n    echo !id!>>\"%AGENT_LOG%\"\r\n  )\r\n  echo {\"id\":\"!id!\",\"title\":\"!title!\",\"description\":\"\",\"issue_type\":\"agent\"}\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"slot\" exit /b 0\r\nif \"%cmd%\"==\"config\" exit /b 0\r\nif \"%cmd%\"==\"init\" exit /b 0\r\nexit /b 1\r\n"
+	windowsScript := "@echo off\r\nsetlocal enabledelayedexpansion\r\nif defined BEADS_DIR_LOG (\r\n  if defined BEADS_DIR (\r\n    echo %BEADS_DIR%>>\"%BEADS_DIR_LOG%\"\r\n  ) else (\r\n    echo ^<unset^> >>\"%BEADS_DIR_LOG%\"\r\n  )\r\n)\r\nset \"cmd=%1\"\r\nset \"arg2=%2\"\r\nset \"arg3=%3\"\r\nif \"%cmd%\"==\"--allow-stale\" (\r\n  set \"cmd=%2\"\r\n  set \"arg2=%3\"\r\n  set \"arg3=%4\"\r\n)\r\nif \"%cmd%\"==\"show\" (\r\n  echo []\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"create\" (\r\n  set \"id=\"\r\n  set \"title=\"\r\n  for %%A in (%*) do (\r\n    set \"arg=%%~A\"\r\n    if /i \"!arg:~0,5!\"==\"--id=\" set \"id=!arg:~5!\"\r\n    if /i \"!arg:~0,8!\"==\"--title=\" set \"title=!arg:~8!\"\r\n  )\r\n  if defined AGENT_LOG (\r\n    echo !id!>>\"%AGENT_LOG%\"\r\n  )\r\n  echo {\"id\":\"!id!\",\"title\":\"!title!\",\"description\":\"\",\"issue_type\":\"agent\"}\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"slot\" exit /b 0\r\nif \"%cmd%\"==\"config\" (\r\n  if /i \"%arg2%\"==\"get\" if /i \"%arg3%\"==\"types.custom\" echo agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"init\" exit /b 0\r\nif \"%cmd%\"==\"migrate\" exit /b 0\r\nexit /b 1\r\n"
 
 	binDir := writeFakeBD(t, script, windowsScript)
 	agentLog := filepath.Join(t.TempDir(), "agents.log")
@@ -1671,7 +1681,13 @@ cmd="$1"
 [[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
 shift
 case "$cmd" in
-  init|config|slot) exit 0 ;;
+  init|slot) exit 0 ;;
+  config)
+    if [[ "$*" == *"get types.custom"* ]]; then
+      echo "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+    fi
+    exit 0
+    ;;
   show) echo "[]" ;;
   create)
     id=""; title=""
@@ -1683,7 +1699,7 @@ case "$cmd" in
   *) exit 0 ;;
 esac
 `
-	windowsScript := "@echo off\r\nif \"%1\"==\"init\" exit /b 0\r\nif \"%1\"==\"config\" exit /b 0\r\nif \"%1\"==\"slot\" exit /b 0\r\nif \"%1\"==\"--allow-stale\" shift\r\nif \"%1\"==\"show\" echo [] & exit /b 0\r\nif \"%1\"==\"create\" echo {\"id\":\"x\",\"title\":\"x\"} & exit /b 0\r\nexit /b 0\r\n"
+	windowsScript := "@echo off\r\nif \"%1\"==\"init\" exit /b 0\r\nif \"%1\"==\"config\" (\r\n  if /i \"%2\"==\"get\" if /i \"%3\"==\"types.custom\" echo agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request\r\n  exit /b 0\r\n)\r\nif \"%1\"==\"slot\" exit /b 0\r\nif \"%1\"==\"--allow-stale\" shift\r\nif \"%1\"==\"show\" echo [] & exit /b 0\r\nif \"%1\"==\"create\" echo {\"id\":\"x\",\"title\":\"x\"} & exit /b 0\r\nexit /b 0\r\n"
 	binDir := writeFakeBD(t, script, windowsScript)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
@@ -1980,7 +1996,13 @@ if [[ "$cmd" == "init" ]]; then
   echo "init $*" >> "$BD_CMD_LOG"
 fi
 case "$cmd" in
-  init|config|migrate) exit 0 ;;
+  init|migrate) exit 0 ;;
+  config)
+    if [[ "$*" == *"get types.custom"* ]]; then
+      echo "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+    fi
+    exit 0
+    ;;
   show) echo "[]" ;;
   create)
     id=""; title=""
@@ -2063,7 +2085,13 @@ if [[ "$cmd" == "init" ]]; then
   echo "init $*" >> "$BD_CMD_LOG"
 fi
 case "$cmd" in
-  init|config|migrate) exit 0 ;;
+  init|migrate) exit 0 ;;
+  config)
+    if [[ "$*" == *"get types.custom"* ]]; then
+      echo "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request"
+    fi
+    exit 0
+    ;;
   show) echo "[]" ;;
   create)
     id=""; title=""
@@ -2113,8 +2141,7 @@ esac
 
 	logData, err := os.ReadFile(cmdLog)
 	if err != nil {
-		// No bd init calls logged means the test is inconclusive; skip.
-		t.Skip("bd init was not logged (may have been skipped due to bdDatabaseExists check)")
+		t.Fatalf("bd init was not logged; no-sync.remote destructive-flag assertion is inconclusive: %v", err)
 	}
 	cmds := string(logData)
 	if strings.Contains(cmds, "--reinit-local") {

@@ -114,8 +114,8 @@ func TestBuildPinnedBDEnvUsesSelectedConnectionMetadata(t *testing.T) {
 	if got["BEADS_DIR"] != beadsDir {
 		t.Fatalf("BEADS_DIR = %q, want %q in %v", got["BEADS_DIR"], beadsDir, env)
 	}
-	if value, ok := got["BEADS_DOLT_SERVER_DATABASE"]; ok {
-		t.Fatalf("BEADS_DOLT_SERVER_DATABASE should be stripped, got %q in %v", value, env)
+	if got["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb in %v", got["BEADS_DOLT_SERVER_DATABASE"], env)
 	}
 	if got["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" {
 		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want 127.0.0.1 in %v", got["BEADS_DOLT_SERVER_HOST"], env)
@@ -130,6 +130,60 @@ func TestBuildPinnedBDEnvUsesSelectedConnectionMetadata(t *testing.T) {
 	}
 	if got["BEADS_DOLT_AUTO_START"] != "0" {
 		t.Fatalf("BEADS_DOLT_AUTO_START should be preserved, got %q in %v", got["BEADS_DOLT_AUTO_START"], env)
+	}
+}
+
+func TestBuildPinnedBDEnvOmitsDataDirForServerDatabase(t *testing.T) {
+	townDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townDir, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townDir, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	beadsDir := filepath.Join(townDir, "testrig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_mode":"server","dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":4407}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	env := BuildPinnedBDEnv([]string{"PATH=/usr/bin"}, beadsDir)
+	got := envMap(env)
+	if got["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb in %v", got["BEADS_DOLT_SERVER_DATABASE"], env)
+	}
+	if value, ok := got["BEADS_DOLT_DATA_DIR"]; ok {
+		t.Fatalf("BEADS_DOLT_DATA_DIR should be absent when server database is pinned, got %q in %v", value, env)
+	}
+}
+
+func TestBuildRoutingBDEnvKeepsDataDirWithoutPinnedDatabase(t *testing.T) {
+	townDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townDir, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townDir, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	beadsDir := filepath.Join(townDir, "testrig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_mode":"server","dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":4407}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	env := BuildRoutingBDEnv([]string{"PATH=/usr/bin"}, beadsDir)
+	got := envMap(env)
+	if _, ok := got["BEADS_DOLT_SERVER_DATABASE"]; ok {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE should be absent for routing env: %v", env)
+	}
+	if got["BEADS_DOLT_DATA_DIR"] != filepath.Join(townDir, ".dolt-data") {
+		t.Fatalf("BEADS_DOLT_DATA_DIR = %q, want town data dir in %v", got["BEADS_DOLT_DATA_DIR"], env)
 	}
 }
 
@@ -178,8 +232,8 @@ func TestBuildPinnedBDEnvFallsBackToGTDoltPort(t *testing.T) {
 		"GT_DOLT_PORT=5507",
 	}, beadsDir)
 	got := envMap(env)
-	if value, ok := got["BEADS_DOLT_SERVER_DATABASE"]; ok {
-		t.Fatalf("BEADS_DOLT_SERVER_DATABASE should be stripped, got %q in %v", value, env)
+	if got["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb in %v", got["BEADS_DOLT_SERVER_DATABASE"], env)
 	}
 	if got["BEADS_DOLT_SERVER_HOST"] != "127.0.0.2" {
 		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want GT_DOLT_HOST fallback in %v", got["BEADS_DOLT_SERVER_HOST"], env)
@@ -289,6 +343,67 @@ func TestArgsAreReadOnlyClassifiesKnownReadCommands(t *testing.T) {
 		if got := SubprocessModeForArgs(args); got != ReadOnlyRouting {
 			t.Fatalf("SubprocessModeForArgs(%v) = %v, want ReadOnlyRouting", args, got)
 		}
+	}
+}
+
+func TestRunWithStdinSkipsTrackedConfigSnapshotForReadOnlyCommands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script stubs")
+	}
+
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(ResetBdAllowStaleCacheForTest)
+
+	binDir := t.TempDir()
+	gitLog := filepath.Join(binDir, "git.log")
+	bdScript := `#!/bin/sh
+if [ "$1" = "--allow-stale" ] && [ "$2" = "version" ]; then
+  echo "bd test"
+  exit 0
+fi
+if [ "$1" = "--allow-stale" ]; then
+  shift
+fi
+case "$1" in
+  show)
+    echo '{"id":"gt-123"}'
+    exit 0
+    ;;
+  *)
+    echo "unexpected bd args: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	gitScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$GIT_LOG"
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(gitScript), 0755); err != nil {
+		t.Fatalf("write git stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_LOG", gitLog)
+
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("prefix: gt\n"), 0644); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+
+	if _, err := (&Beads{workDir: workDir}).run("show", "gt-123", "--json"); err != nil {
+		t.Fatalf("run show: %v", err)
+	}
+	if data, err := os.ReadFile(gitLog); err == nil && len(data) > 0 {
+		t.Fatalf("read-only bd call unexpectedly probed git:\n%s", string(data))
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read git log: %v", err)
 	}
 }
 
@@ -3827,12 +3942,19 @@ func TestBuildRunEnv_OverridesStaleDoltPortFromBeadsDir(t *testing.T) {
 		switch e {
 		case "BEADS_DOLT_PORT=43113":
 			found = true
+		case "BEADS_DOLT_SERVER_PORT=43113":
+			// expected; server-mode bd commands need the canonical server port too
 		case "BEADS_DOLT_PORT=3307":
 			t.Fatalf("stale BEADS_DOLT_PORT preserved in env: %v", env)
+		case "BEADS_DOLT_SERVER_PORT=3307":
+			t.Fatalf("stale BEADS_DOLT_SERVER_PORT preserved in env: %v", env)
 		}
 	}
 	if !found {
 		t.Fatalf("expected BEADS_DOLT_PORT=43113 in env, got %v", env)
+	}
+	if !containsEnv(env, "BEADS_DOLT_SERVER_PORT=43113") {
+		t.Fatalf("expected BEADS_DOLT_SERVER_PORT=43113 in env, got %v", env)
 	}
 }
 
@@ -3855,12 +3977,19 @@ func TestBuildRoutingEnv_OverridesStaleDoltPortFromBeadsDir(t *testing.T) {
 		switch e {
 		case "BEADS_DOLT_PORT=43113":
 			found = true
+		case "BEADS_DOLT_SERVER_PORT=43113":
+			// expected; routing still needs the fallback server connection
 		case "BEADS_DOLT_PORT=3307":
 			t.Fatalf("stale BEADS_DOLT_PORT preserved in env: %v", env)
+		case "BEADS_DOLT_SERVER_PORT=3307":
+			t.Fatalf("stale BEADS_DOLT_SERVER_PORT preserved in env: %v", env)
 		}
 	}
 	if !found {
 		t.Fatalf("expected BEADS_DOLT_PORT=43113 in env, got %v", env)
+	}
+	if !containsEnv(env, "BEADS_DOLT_SERVER_PORT=43113") {
+		t.Fatalf("expected BEADS_DOLT_SERVER_PORT=43113 in env, got %v", env)
 	}
 }
 
@@ -3956,6 +4085,7 @@ printf 'unknown\n'
 		"BEADS_DIR=" + beadsDir,
 		"BEADS_DOLT_PORT=3307",
 		"BEADS_DOLT_SERVER_HOST=127.0.0.1",
+		"BEADS_DOLT_SERVER_PORT=3307",
 	} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("bd subprocess env missing %q:\n%s", want, log)
