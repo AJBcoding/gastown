@@ -18,8 +18,9 @@ import (
 // Update this when Gas Town requires new beads features.
 const MinBeadsVersion = "0.57.0"
 
-// BeadsInstallPath is the go install path for beads.
-const BeadsInstallPath = "github.com/steveyegge/beads/cmd/bd@latest"
+// BeadsInstallPath is the go install path for the bd version compatible with
+// this Gas Town release.
+const BeadsInstallPath = "github.com/steveyegge/beads/cmd/bd@v1.0.4"
 
 // BeadsStatus represents the state of the beads installation.
 type BeadsStatus int
@@ -94,7 +95,7 @@ func EnsureBeads(autoInstall bool) error {
 	return nil
 }
 
-// installBeads runs go install to install the latest beads.
+// installBeads runs go install to install the compatible beads version.
 // GOBIN is set to ~/.local/bin so the binary lands in the canonical
 // location rather than the default $GOPATH/bin (~/go/bin/).
 func installBeads() error {
