@@ -42,7 +42,7 @@ To use NOS Town with this Gas Town fork:
 ```bash
 # Gas Town deps (same as standard install)
 go install github.com/kab0rn/gastown/cmd/gt@latest
-go install github.com/steveyegge/beads/cmd/bd@latest
+go install github.com/steveyegge/beads/cmd/bd@v1.0.4
 
 # NOS Town CLI
 go install github.com/kab0rn/nostown/cmd/nos@latest

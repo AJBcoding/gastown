@@ -16,7 +16,7 @@ import (
 
 // MinBeadsVersion is the minimum compatible beads version for this Gas Town release.
 // Update this when Gas Town requires new beads features.
-const MinBeadsVersion = "0.57.0"
+const MinBeadsVersion = "1.0.4"
 
 // BeadsInstallPath is the go install path for the bd version compatible with
 // this Gas Town release.

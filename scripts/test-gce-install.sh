@@ -90,7 +90,7 @@ if command -v bd &> /dev/null; then
     check "beads already installed: $(bd --version)"
 else
     # Install via go install
-    go install github.com/steveyegge/beads/cmd/bd@latest
+    go install github.com/steveyegge/beads/cmd/bd@v1.0.4
     if command -v bd &> /dev/null; then
         check "beads installed: $(bd --version)"
     else

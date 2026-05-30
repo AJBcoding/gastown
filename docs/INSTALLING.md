@@ -11,7 +11,7 @@ Complete setup guide for Gas Town multi-agent orchestrator.
 | **Go** | 1.25.8+ | `go version` | See [golang.org](https://go.dev/doc/install) |
 | **Git** | 2.20+ | `git --version` | See below |
 | **Dolt** | >= 2.0.7 | `dolt version` | macOS: `brew install dolt`; other platforms: see [dolthub/dolt](https://github.com/dolthub/dolt?tab=readme-ov-file#installation) |
-| **Beads** | >= 0.55.4 | `bd version` | Installed by `brew install gastown`, or from source with `go install github.com/steveyegge/beads/cmd/bd@latest` |
+| **Beads** | >= 1.0.4 | `bd version` | Installed by `brew install gastown`, or from source with `go install github.com/steveyegge/beads/cmd/bd@v1.0.4` |
 
 ### Optional (for Full Stack Mode)
 
@@ -102,7 +102,7 @@ instead.
 
 ```bash
 brew install dolt
-go install github.com/steveyegge/beads/cmd/bd@latest
+go install github.com/steveyegge/beads/cmd/bd@v1.0.4
 export PATH="$HOME/.local/bin:$PATH:$HOME/go/bin"
 git clone https://github.com/steveyegge/gastown.git
 cd gastown
@@ -252,7 +252,7 @@ If you also installed Beads with Go, keep `$HOME/go/bin` in PATH for `bd`.
 Beads CLI not installed:
 
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+go install github.com/steveyegge/beads/cmd/bd@v1.0.4
 ```
 
 ### `gt doctor` shows errors
@@ -327,7 +327,7 @@ gt doctor --fix
 If you maintain Beads separately from Homebrew, update `bd` from its own source:
 
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+go install github.com/steveyegge/beads/cmd/bd@v1.0.4
 ```
 
 Run the `command -v gt` and `gt version` checks before `gt doctor --fix` so a
