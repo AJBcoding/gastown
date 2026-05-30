@@ -276,7 +276,8 @@ func TestGetProcessNamesRespectsRegistryOverride(t *testing.T) {
 }
 
 func TestResolveProcessNames(t *testing.T) {
-	t.Parallel()
+	// Mutates the package-global agent registry; keep serial to avoid
+	// leaking temporary registry entries into parallel preset tests.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
@@ -1440,7 +1441,8 @@ func TestAllHookSupportingAgentsHaveHookFields(t *testing.T) {
 }
 
 func TestResolveACPConfig(t *testing.T) {
-	t.Parallel()
+	// Mutates the package-global agent registry; keep serial to avoid
+	// leaking temporary registry entries into parallel preset tests.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
@@ -1525,7 +1527,8 @@ func TestSupportsACPWithCustomAgent(t *testing.T) {
 }
 
 func TestGetACPCommand(t *testing.T) {
-	t.Parallel()
+	// Mutates the package-global agent registry; keep serial to avoid
+	// leaking temporary registry entries into parallel preset tests.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
