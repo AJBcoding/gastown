@@ -3,6 +3,7 @@ package doctor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -84,6 +85,157 @@ func TestRunIgnoresJSONLWhenDoltUnavailable(t *testing.T) {
 	}
 	if len(check.misclassified) != 0 {
 		t.Fatalf("expected no misclassified wisps from stale JSONL, got %d", len(check.misclassified))
+	}
+}
+
+func TestBuildMisclassifiedWispDependenciesCopyQueryUsesSplitTargetSchema(t *testing.T) {
+	query := buildMisclassifiedWispDependenciesCopyQuery("'gt-wisp-1'", true, false)
+
+	if !strings.Contains(query, "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)") {
+		t.Fatalf("split-schema query did not use dependency target COALESCE: %s", query)
+	}
+	if strings.Contains(query, "d.depends_on_id") {
+		t.Fatalf("split-schema query still selects legacy target column: %s", query)
+	}
+	if !strings.Contains(query, "WHERE d.issue_id IN ('gt-wisp-1')") {
+		t.Fatalf("split-schema query lost id filter: %s", query)
+	}
+}
+
+func TestBuildMisclassifiedWispDependenciesCopyQueryUsesLegacyTargetSchema(t *testing.T) {
+	query := buildMisclassifiedWispDependenciesCopyQuery("'gt-wisp-1'", false, false)
+
+	if !strings.Contains(query, "SELECT d.issue_id, d.depends_on_id, d.type") {
+		t.Fatalf("legacy query did not select depends_on_id: %s", query)
+	}
+}
+
+func TestBuildMisclassifiedWispDependenciesCopyQueryUsesSplitWispTargetSchema(t *testing.T) {
+	query := buildMisclassifiedWispDependenciesCopyQuery("'gt-wisp-1'", false, true)
+
+	if !strings.Contains(query, "INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type") {
+		t.Fatalf("split wisp-target query did not insert typed target columns: %s", query)
+	}
+	if strings.Contains(query, "INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id") {
+		t.Fatalf("split wisp-target query still inserts generated depends_on_id: %s", query)
+	}
+	if !strings.Contains(query, "WHERE d.issue_id IN ('gt-wisp-1')") {
+		t.Fatalf("split wisp-target query lost id filter: %s", query)
+	}
+}
+
+func TestBuildMisclassifiedWispDependenciesCopyQueryReclassifiesMigratingSplitIssueTargets(t *testing.T) {
+	query := buildMisclassifiedWispDependenciesCopyQuery("'gt-wisp-1','gt-wisp-2'", true, true)
+
+	if !strings.Contains(query, "d.depends_on_issue_id IN ('gt-wisp-1','gt-wisp-2')") {
+		t.Fatalf("split-source query did not treat migrating ids as wisp targets: %s", query)
+	}
+	if !strings.Contains(query, "EXISTS (SELECT 1 FROM wisps target_wisp WHERE target_wisp.id = d.depends_on_issue_id)") {
+		t.Fatalf("split-source query did not treat existing wisps as wisp targets: %s", query)
+	}
+	if strings.Contains(query, "SELECT d.issue_id, d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external") {
+		t.Fatalf("split-source wisp copy should not blindly copy typed target columns: %s", query)
+	}
+}
+
+func TestCopyMisclassifiedWispDependenciesRetriesSplitSourceThenGeneratedTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd stub is shell-specific")
+	}
+
+	logPath := installFakeBDForMisclassifiedDependencyCopy(t)
+
+	if err := copyMisclassifiedWispDependencies(t.TempDir(), "'gt-wisp-1','gt-wisp-2'"); err != nil {
+		t.Fatalf("copyMisclassifiedWispDependencies() error = %v", err)
+	}
+
+	lines := readMisclassifiedDependencyCopyLog(t, logPath)
+	if len(lines) != 4 {
+		t.Fatalf("bd queries = %v, want column probe plus 3 copy attempts", lines)
+	}
+	assertMisclassifiedDependencyCopySequence(t, lines)
+}
+
+func installFakeBDForMisclassifiedDependencyCopy(t *testing.T) string {
+	t.Helper()
+
+	binDir := t.TempDir()
+	statePath := filepath.Join(t.TempDir(), "bd-state")
+	logPath := filepath.Join(t.TempDir(), "bd-queries.log")
+	script := `#!/usr/bin/env bash
+set -u
+if [ "${1:-}" != "sql" ]; then
+  exit 1
+fi
+if [ "${2:-}" = "--csv" ]; then
+  printf 'csv:%s\n' "${3:-}" >> "$BD_QUERY_LOG"
+  printf 'cnt\n0\n'
+  exit 0
+fi
+printf 'write:%s\n' "${2:-}" >> "$BD_QUERY_LOG"
+state=0
+if [ -f "$BD_STATE" ]; then
+  state="$(cat "$BD_STATE")"
+fi
+state=$((state + 1))
+printf '%s\n' "$state" > "$BD_STATE"
+case "$state" in
+  1)
+    printf "Error 1054 (42S22): Unknown column 'd.depends_on_id' in 'field list'\n" >&2
+    exit 1
+    ;;
+  2)
+    printf "Error 3105 (HY000): The value specified for generated column 'depends_on_id' in table 'wisp_dependencies' is not allowed.\n" >&2
+    exit 1
+    ;;
+  3)
+    exit 0
+    ;;
+  *)
+    printf 'unexpected bd sql write call %s\n' "$state" >&2
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STATE", statePath)
+	t.Setenv("BD_QUERY_LOG", logPath)
+
+	return logPath
+}
+
+func readMisclassifiedDependencyCopyLog(t *testing.T, logPath string) []string {
+	t.Helper()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	return strings.Split(strings.TrimSpace(string(data)), "\n")
+}
+
+func assertMisclassifiedDependencyCopySequence(t *testing.T, lines []string) {
+	t.Helper()
+
+	if !strings.Contains(lines[0], "INFORMATION_SCHEMA.COLUMNS") || !strings.Contains(lines[0], "wisp_dependencies") {
+		t.Fatalf("first query = %q, want wisp dependency target column probe", lines[0])
+	}
+	if !strings.Contains(lines[1], "INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id") ||
+		!strings.Contains(lines[1], "SELECT d.issue_id, d.depends_on_id") ||
+		!strings.Contains(lines[1], "WHERE d.issue_id IN ('gt-wisp-1','gt-wisp-2')") {
+		t.Fatalf("first copy attempt = %q, want legacy source into legacy target", lines[1])
+	}
+	if !strings.Contains(lines[2], "INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id") ||
+		!strings.Contains(lines[2], "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)") {
+		t.Fatalf("second copy attempt = %q, want split-source retry into legacy target", lines[2])
+	}
+	if !strings.Contains(lines[3], "INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external") ||
+		!strings.Contains(lines[3], "d.depends_on_issue_id IN ('gt-wisp-1','gt-wisp-2')") ||
+		!strings.Contains(lines[3], "WHERE d.issue_id IN ('gt-wisp-1','gt-wisp-2')") {
+		t.Fatalf("third copy attempt = %q, want generated-target retry into split target columns", lines[3])
 	}
 }
 

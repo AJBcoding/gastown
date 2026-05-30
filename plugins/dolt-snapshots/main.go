@@ -31,6 +31,17 @@ var (
 	multiDash  = regexp.MustCompile(`-{2,}`)
 )
 
+// Keep dependency-target schema constants and helpers in sync with
+// internal/beads/dependency_schema.go. This plugin is a separate module, so it
+// cannot import gastown's internal package directly.
+const dependencyTargetAlias = "depends_on_id"
+
+var splitDependencyTargetColumns = []string{
+	"depends_on_issue_id",
+	"depends_on_wisp_id",
+	"depends_on_external",
+}
+
 // route represents a single entry from routes.jsonl.
 type route struct {
 	Prefix string `json:"prefix"`
@@ -382,24 +393,19 @@ func findConvoysNeedingSnapshots(db *sql.DB) ([]convoyRow, error) {
 // discoverConvoyDatabases finds which rig databases a convoy touches
 // by looking at its tracked issues' prefixes.
 func discoverConvoyDatabases(db *sql.DB, convoyID string, databases []string, routes map[string]string) ([]string, error) {
-	query := `
-		SELECT DISTINCT d.depends_on_id
-		FROM hq.dependencies d
-		WHERE d.issue_id = ? AND d.type = 'tracks'
-	`
-	rows, err := db.Query(query, convoyID)
+	dependencyIDs, err := discoverConvoyDependencyIDs(db, convoyID, false)
 	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	dbSet := make(map[string]bool)
-	for rows.Next() {
-		var depID string
-		if err := rows.Scan(&depID); err != nil {
+		if !isDependencyTargetColumnError(err) {
 			return nil, err
 		}
+		dependencyIDs, err = discoverConvoyDependencyIDs(db, convoyID, true)
+		if err != nil {
+			return nil, err
+		}
+	}
 
+	dbSet := make(map[string]bool)
+	for _, depID := range dependencyIDs {
 		dbName := resolveDependencyDB(depID, routes)
 		if dbName == "" {
 			continue
@@ -418,7 +424,82 @@ func discoverConvoyDatabases(db *sql.DB, convoyID string, databases []string, ro
 	for d := range dbSet {
 		result = append(result, d)
 	}
-	return result, rows.Err()
+	return result, nil
+}
+
+func discoverConvoyDependencyIDs(db *sql.DB, convoyID string, splitTarget bool) ([]string, error) {
+	query := fmt.Sprintf(`
+		SELECT DISTINCT %s
+		FROM hq.dependencies d
+		WHERE d.issue_id = ? AND d.type = 'tracks'
+	`, dependencyTargetSelectExpr("d", splitTarget))
+	rows, err := db.Query(query, convoyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var dependencyIDs []string
+	for rows.Next() {
+		var depID string
+		if err := rows.Scan(&depID); err != nil {
+			return nil, err
+		}
+		dependencyIDs = append(dependencyIDs, depID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dependencyIDs, nil
+}
+
+func dependencyTargetSelectExpr(tableAlias string, splitTarget bool) string {
+	expr := dependencyTargetExpr(tableAlias, splitTarget)
+	if !splitTarget {
+		return expr
+	}
+	return expr + " AS " + dependencyTargetAlias
+}
+
+func dependencyTargetExpr(tableAlias string, splitTarget bool) string {
+	if !splitTarget {
+		return qualifyDependencyColumn(tableAlias, dependencyTargetAlias)
+	}
+
+	columns := make([]string, 0, len(splitDependencyTargetColumns))
+	for _, column := range splitDependencyTargetColumns {
+		columns = append(columns, qualifyDependencyColumn(tableAlias, column))
+	}
+	return "COALESCE(" + strings.Join(columns, ", ") + ")"
+}
+
+func qualifyDependencyColumn(tableAlias, column string) string {
+	if tableAlias == "" {
+		return column
+	}
+	return tableAlias + "." + column
+}
+
+func isDependencyTargetColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	missingColumn := strings.Contains(msg, "unknown column") ||
+		strings.Contains(msg, "could not be found") ||
+		strings.Contains(msg, "no such column")
+	if !missingColumn {
+		return false
+	}
+	if strings.Contains(msg, dependencyTargetAlias) {
+		return true
+	}
+	for _, column := range splitDependencyTargetColumns {
+		if strings.Contains(msg, column) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveDependencyDB extracts the database name from a dependency ID.

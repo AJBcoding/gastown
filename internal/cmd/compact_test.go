@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,8 +25,8 @@ func TestGetTTL(t *testing.T) {
 		{"recovery", 7 * 24 * time.Hour},
 		{"escalation", 7 * 24 * time.Hour},
 		{"default", 24 * time.Hour},
-		{"", 24 * time.Hour},          // empty falls back to default
-		{"unknown", 24 * time.Hour},   // unknown falls back to default
+		{"", 24 * time.Hour},        // empty falls back to default
+		{"unknown", 24 * time.Hour}, // unknown falls back to default
 	}
 
 	for _, tc := range tests {
@@ -225,6 +228,132 @@ func TestExtractJSONArray(t *testing.T) {
 				t.Errorf("extractJSONArray(%q) = %q, want %q", tc.data, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestOrphanedWispDepsCleanupQueryUsesSplitTarget(t *testing.T) {
+	query := orphanedWispDepsCleanupQuery(true)
+	targetExpr := "COALESCE(wisp_dependencies.depends_on_issue_id, wisp_dependencies.depends_on_wisp_id, wisp_dependencies.depends_on_external)"
+
+	if strings.Contains(query, "wisp_dependencies.depends_on_id") {
+		t.Fatalf("split cleanup query should not use legacy depends_on_id column:\n%s", query)
+	}
+	if strings.Contains(query, targetExpr) {
+		t.Fatalf("split cleanup query should validate typed targets directly, not through %s:\n%s", targetExpr, query)
+	}
+	if !strings.Contains(query, "issues WHERE id = wisp_dependencies.depends_on_issue_id") {
+		t.Fatalf("split cleanup query should preserve live issue targets:\n%s", query)
+	}
+	if !strings.Contains(query, "wisps WHERE id = wisp_dependencies.depends_on_wisp_id") {
+		t.Fatalf("split cleanup query should preserve live wisp targets:\n%s", query)
+	}
+	if !strings.Contains(query, "wisp_dependencies.depends_on_external IS NOT NULL") {
+		t.Fatalf("split cleanup query should preserve external targets:\n%s", query)
+	}
+}
+
+func TestOrphanedWispDepsCleanupQueryPreservesSplitTargetsByType(t *testing.T) {
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		t.Skip("sqlite3 not found")
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "split-wisp-deps-cleanup.db")
+	script := `
+CREATE TABLE issues (
+  id varchar(255) PRIMARY KEY
+);
+CREATE TABLE wisps (
+  id varchar(255) PRIMARY KEY
+);
+CREATE TABLE wisp_dependencies (
+  issue_id varchar(255) NOT NULL,
+  depends_on_issue_id varchar(255),
+  depends_on_wisp_id varchar(255),
+  depends_on_external varchar(255)
+);
+INSERT INTO wisps (id) VALUES ('gt-source'), ('gt-wisp-target');
+INSERT INTO issues (id) VALUES ('gt-issue-target');
+INSERT INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external) VALUES
+  ('gt-source', 'gt-issue-target', NULL, NULL),
+  ('gt-source', NULL, 'gt-wisp-target', NULL),
+  ('gt-source', NULL, NULL, 'external:ticket-1'),
+  ('gt-source', 'gt-missing-issue', NULL, NULL),
+  ('gt-source', NULL, 'gt-missing-wisp', NULL),
+  ('gt-missing-source', NULL, NULL, 'external:orphan-source');
+` + orphanedWispDepsCleanupQuery(true) + `;
+.mode list
+SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)
+FROM wisp_dependencies
+ORDER BY 1;
+`
+
+	cmd := exec.Command(sqlite, "-batch", dbPath)
+	cmd.Stdin = strings.NewReader(script)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("sqlite fixture failed: %v\n%s", err, output)
+	}
+
+	got := strings.TrimSpace(string(output))
+	want := strings.Join([]string{
+		"external:ticket-1",
+		"gt-issue-target",
+		"gt-wisp-target",
+	}, "\n")
+	if got != want {
+		t.Fatalf("split cleanup survivors:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestOrphanedWispDepsCleanupQueryPreservesLegacyTargetsByType(t *testing.T) {
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		t.Skip("sqlite3 not found")
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "legacy-wisp-deps-cleanup.db")
+	script := `
+CREATE TABLE issues (
+  id varchar(255) PRIMARY KEY
+);
+CREATE TABLE wisps (
+  id varchar(255) PRIMARY KEY
+);
+CREATE TABLE wisp_dependencies (
+  issue_id varchar(255) NOT NULL,
+  depends_on_id varchar(255)
+);
+INSERT INTO wisps (id) VALUES ('gt-source'), ('gt-wisp-target');
+INSERT INTO issues (id) VALUES ('gt-issue-target');
+INSERT INTO wisp_dependencies (issue_id, depends_on_id) VALUES
+  ('gt-source', 'gt-issue-target'),
+  ('gt-source', 'gt-wisp-target'),
+  ('gt-source', 'external:ticket-1'),
+  ('gt-source', 'gt-missing-target'),
+  ('gt-missing-source', 'external:orphan-source');
+` + orphanedWispDepsCleanupQuery(false) + `;
+.mode list
+SELECT depends_on_id
+FROM wisp_dependencies
+ORDER BY depends_on_id;
+`
+
+	cmd := exec.Command(sqlite, "-batch", dbPath)
+	cmd.Stdin = strings.NewReader(script)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("sqlite fixture failed: %v\n%s", err, output)
+	}
+
+	got := strings.TrimSpace(string(output))
+	want := strings.Join([]string{
+		"external:ticket-1",
+		"gt-issue-target",
+		"gt-wisp-target",
+	}, "\n")
+	if got != want {
+		t.Fatalf("legacy cleanup survivors:\n%s\nwant:\n%s", got, want)
 	}
 }
 

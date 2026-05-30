@@ -3,11 +3,11 @@
 // The wisps table is a dolt_ignored copy of the issues table schema, used for
 // ephemeral operational data (agent beads, patrol wisps, etc.) that should not
 // be version-controlled. This migration:
-//   1. Creates the wisps table and auxiliary tables (wisp_labels, wisp_comments,
-//      wisp_events, wisp_dependencies) if they don't exist
-//   2. Copies existing agent beads (issue_type='agent') from issues to wisps
-//   3. Copies associated labels, comments, events, and dependencies
-//   4. Closes the originals in the issues table
+//  1. Creates the wisps table and auxiliary tables (wisp_labels, wisp_comments,
+//     wisp_events, wisp_dependencies) if they don't exist
+//  2. Copies existing agent beads (issue_type='agent') from issues to wisps
+//  3. Copies associated labels, comments, events, and dependencies
+//  4. Closes the originals in the issues table
 //
 // The migration uses `bd sql` for beads-side operations (copying agent beads between
 // the issues and wisps tables in bd's own database). Additionally, it ensures that
@@ -25,6 +25,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // MigrateWispsResult holds migration statistics.
@@ -256,8 +257,7 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 	result.EventsCopied = cnt
 
 	// Copy dependencies
-	if err := bdSQL(workDir,
-		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
+	if err := copyWispDependencies(workDir); err != nil {
 		if !strings.Contains(err.Error(), "nothing") {
 			return fmt.Errorf("copying dependencies: %w", err)
 		}
@@ -266,6 +266,50 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 	result.DepsCopied = cnt
 
 	return nil
+}
+
+func copyWispDependencies(workDir string) error {
+	splitWispTarget := bdTableHasColumn(workDir, "wisp_dependencies", beads.DependencyTargetWispColumn)
+	splitSourceTarget := false
+
+	err := bdSQL(workDir, buildWispDependenciesCopyQuery(splitSourceTarget, splitWispTarget))
+	if err == nil {
+		return nil
+	}
+	if beads.IsDependencyTargetColumnError(err) {
+		splitSourceTarget = true
+		err = bdSQL(workDir, buildWispDependenciesCopyQuery(splitSourceTarget, splitWispTarget))
+	}
+	if !splitWispTarget && beads.IsDependencyTargetGeneratedWriteError(err) {
+		return bdSQL(workDir, buildWispDependenciesCopyQuery(splitSourceTarget, true))
+	}
+	return err
+}
+
+func buildWispDependenciesCopyQuery(splitSourceTarget, splitWispTarget bool) string {
+	if splitWispTarget {
+		return fmt.Sprintf(
+			"INSERT IGNORE INTO wisp_dependencies (issue_id, %s, type, created_at, created_by, metadata, thread_id) "+
+				"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id",
+			beads.DependencyTargetSplitColumns(),
+			beads.DependencyTargetSplitValuesExprsForWispCopy("d", splitSourceTarget, ""),
+		)
+	}
+
+	return fmt.Sprintf(
+		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) "+
+			"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id",
+		beads.DependencyTargetExpr("d", splitSourceTarget),
+	)
+}
+
+func bdTableHasColumn(workDir, tableName, columnName string) bool {
+	cnt, err := bdSQLCount(workDir, fmt.Sprintf(
+		"SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s' AND COLUMN_NAME = '%s'",
+		tableName,
+		columnName,
+	))
+	return err == nil && cnt > 0
 }
 
 // deriveDBName extracts the database name from the workDir relative to townRoot.

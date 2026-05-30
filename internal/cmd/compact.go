@@ -276,15 +276,16 @@ func runCompact(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// cleanOrphanedWispDeps removes wisp_dependencies rows where either side no
-// longer exists in the wisps table. This happens when bd delete removes a wisp
-// but leaves behind its dependency records (bd delete has no cascade logic for
-// the wisp-level tables). Runs as a post-compact sweep.
+// cleanOrphanedWispDeps removes wisp_dependencies rows where the source wisp
+// no longer exists, or where the target no longer exists for its stored type.
+// This happens when bd delete removes a wisp but leaves behind its dependency
+// records (bd delete has no cascade logic for the wisp-level tables). Runs as a
+// post-compact sweep.
 func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
-	const q = `DELETE FROM wisp_dependencies WHERE ` +
-		`NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.issue_id) ` +
-		`OR NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.depends_on_id)`
-	out, err := bd.Run("sql", q)
+	out, err := bd.Run("sql", orphanedWispDepsCleanupQuery(false))
+	if beads.IsDependencyTargetColumnError(err) {
+		out, err = bd.Run("sql", orphanedWispDepsCleanupQuery(true))
+	}
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("orphaned wisp_deps cleanup: %v", err))
 		return
@@ -295,6 +296,29 @@ func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 	if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "OK, %d rows affected", &n); scanErr == nil {
 		result.OrphanedWispDeps = n
 	}
+}
+
+func orphanedWispDepsCleanupQuery(splitTarget bool) string {
+	sourceMissing := `NOT EXISTS (SELECT 1 FROM wisps WHERE id = wisp_dependencies.issue_id)`
+	if splitTarget {
+		issueTarget := "wisp_dependencies." + beads.DependencyTargetIssueColumn
+		wispTarget := "wisp_dependencies." + beads.DependencyTargetWispColumn
+		externalTarget := "wisp_dependencies." + beads.DependencyTargetExternalColumn
+		targetExists := strings.Join([]string{
+			fmt.Sprintf("(%s IS NOT NULL AND EXISTS (SELECT 1 FROM issues WHERE id = %s))", issueTarget, issueTarget),
+			fmt.Sprintf("(%s IS NOT NULL AND EXISTS (SELECT 1 FROM wisps WHERE id = %s))", wispTarget, wispTarget),
+			fmt.Sprintf("(%s IS NOT NULL)", externalTarget),
+		}, " OR ")
+		return `DELETE FROM wisp_dependencies WHERE ` + sourceMissing + ` OR NOT (` + targetExists + `)`
+	}
+
+	targetExpr := beads.DependencyTargetExpr("wisp_dependencies", false)
+	targetExists := strings.Join([]string{
+		fmt.Sprintf("EXISTS (SELECT 1 FROM wisps WHERE id = %s)", targetExpr),
+		fmt.Sprintf("EXISTS (SELECT 1 FROM issues WHERE id = %s)", targetExpr),
+		fmt.Sprintf("(%s IS NOT NULL AND %s LIKE 'external:%%')", targetExpr, targetExpr),
+	}, " OR ")
+	return `DELETE FROM wisp_dependencies WHERE ` + sourceMissing + ` OR NOT (` + targetExists + `)`
 }
 
 // listWisps queries all ephemeral issues from the database.

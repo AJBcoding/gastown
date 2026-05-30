@@ -238,14 +238,15 @@ func (c *CheckMisclassifiedWisps) purgeRigBatch(ctx *CheckContext, workDir, rigN
 			table: "wisp_events",
 			query: fmt.Sprintf("INSERT IGNORE INTO wisp_events (issue_id, event_type, actor, old_value, new_value, comment, created_at) SELECT e.issue_id, e.event_type, e.actor, e.old_value, e.new_value, e.comment, e.created_at FROM events e WHERE e.issue_id IN (%s)", idList),
 		},
-		{
-			table: "wisp_dependencies",
-			query: fmt.Sprintf("INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d WHERE d.issue_id IN (%s)", idList),
-		},
 	}
 	for _, aux := range auxCopies {
 		if bdTableExistsDoctor(workDir, aux.table) {
 			_ = execBdSQLWrite(workDir, aux.query) // Best-effort
+		}
+	}
+	if bdTableExistsDoctor(workDir, "wisp_dependencies") {
+		if err := copyMisclassifiedWispDependencies(workDir, idList); err != nil {
+			return fmt.Errorf("copy dependencies to wisp_dependencies: %w", err)
 		}
 	}
 
@@ -273,6 +274,62 @@ func (c *CheckMisclassifiedWisps) purgeRigBatch(ctx *CheckContext, workDir, rigN
 	}
 
 	return nil
+}
+
+func copyMisclassifiedWispDependencies(workDir, idList string) error {
+	splitWispTarget := bdTableHasColumnDoctor(workDir, "wisp_dependencies", beads.DependencyTargetWispColumn)
+	splitSourceTarget := false
+
+	err := execBdSQLWrite(workDir, buildMisclassifiedWispDependenciesCopyQuery(idList, splitSourceTarget, splitWispTarget))
+	if err == nil {
+		return nil
+	}
+	if beads.IsDependencyTargetColumnError(err) {
+		splitSourceTarget = true
+		err = execBdSQLWrite(workDir, buildMisclassifiedWispDependenciesCopyQuery(idList, splitSourceTarget, splitWispTarget))
+	}
+	if !splitWispTarget && beads.IsDependencyTargetGeneratedWriteError(err) {
+		return execBdSQLWrite(workDir, buildMisclassifiedWispDependenciesCopyQuery(idList, splitSourceTarget, true))
+	}
+	return err
+}
+
+func buildMisclassifiedWispDependenciesCopyQuery(idList string, splitSourceTarget, splitWispTarget bool) string {
+	if splitWispTarget {
+		return fmt.Sprintf(
+			"INSERT IGNORE INTO wisp_dependencies (issue_id, %s, type, created_at, created_by, metadata, thread_id) "+
+				"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d WHERE d.issue_id IN (%s)",
+			beads.DependencyTargetSplitColumns(),
+			beads.DependencyTargetSplitValuesExprsForWispCopy("d", splitSourceTarget, idList),
+			idList,
+		)
+	}
+
+	return fmt.Sprintf(
+		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) "+
+			"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d WHERE d.issue_id IN (%s)",
+		beads.DependencyTargetExpr("d", splitSourceTarget),
+		idList,
+	)
+}
+
+func bdTableHasColumnDoctor(workDir, tableName, columnName string) bool {
+	query := fmt.Sprintf(
+		"SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s' AND COLUMN_NAME = '%s'",
+		tableName,
+		columnName,
+	)
+	cmd := exec.Command("bd", "sql", "--csv", query) //nolint:gosec // G204: tableName and columnName are hardcoded by callers
+	cmd.Dir = workDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	records, err := csv.NewReader(strings.NewReader(string(output))).ReadAll()
+	if err != nil || len(records) < 2 || len(records[1]) < 1 {
+		return false
+	}
+	return strings.TrimSpace(records[1][0]) != "0"
 }
 
 // bdTableExistsDoctor checks if a table exists by attempting to query it.

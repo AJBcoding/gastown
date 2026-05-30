@@ -1,8 +1,16 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -93,8 +101,8 @@ func TestIsSystemDB(t *testing.T) {
 		{"lora_forge", false},
 		{"node0", false},
 		// Edge cases: names that start with system prefixes but aren't
-		{"testdb", false},        // exactly "testdb" with no underscore
-		{"beads", false},         // exactly "beads"
+		{"testdb", false},           // exactly "testdb" with no underscore
+		{"beads", false},            // exactly "beads"
 		{"beads_production", false}, // doesn't match beads_t or beads_pt
 	}
 
@@ -279,6 +287,48 @@ func TestResolveDependencyDB_EmptyRoutes(t *testing.T) {
 	}
 }
 
+func TestDiscoverConvoyDatabasesRetriesSplitDependencyTargetSchema(t *testing.T) {
+	script := &dependencyQueryScript{
+		legacyErr: errors.New("Error 1054 (42S22): Unknown column 'd.depends_on_id' in 'field list'"),
+		rows: [][]driver.Value{
+			{"external:petals:pe-123"},
+			{"lf-456"},
+			{"zz-ignored"},
+		},
+	}
+	db := sql.OpenDB(dependencyQueryConnector{script: script})
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	got, err := discoverConvoyDatabases(db, "hq-cv-1", []string{"petals", "lora_forge", "node0"}, map[string]string{
+		"lf": "lora_forge",
+	})
+	if err != nil {
+		t.Fatalf("discoverConvoyDatabases() error = %v", err)
+	}
+
+	want := map[string]bool{"petals": true, "lora_forge": true}
+	if len(got) != len(want) {
+		t.Fatalf("discoverConvoyDatabases() = %v, want entries %v", got, want)
+	}
+	for _, dbName := range got {
+		if !want[dbName] {
+			t.Fatalf("discoverConvoyDatabases() returned unexpected database %q in %v", dbName, got)
+		}
+	}
+
+	queries := script.Queries()
+	if len(queries) != 2 {
+		t.Fatalf("queries = %v, want legacy query and split retry", queries)
+	}
+	if !strings.Contains(queries[0], "d.depends_on_id") {
+		t.Fatalf("legacy query = %q, want d.depends_on_id", queries[0])
+	}
+	if !strings.Contains(queries[1], "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external) AS depends_on_id") {
+		t.Fatalf("split query = %q, want split target COALESCE", queries[1])
+	}
+}
+
 func TestResolveHost(t *testing.T) {
 	// Flag takes precedence
 	if got := resolveHost("192.168.1.1"); got != "192.168.1.1" {
@@ -297,6 +347,93 @@ func TestResolveHost(t *testing.T) {
 	if got := resolveHost(""); got != "127.0.0.1" {
 		t.Errorf("resolveHost default = %q, want 127.0.0.1", got)
 	}
+}
+
+type dependencyQueryConnector struct {
+	script *dependencyQueryScript
+}
+
+func (c dependencyQueryConnector) Connect(context.Context) (driver.Conn, error) {
+	return dependencyQueryConn{script: c.script}, nil
+}
+
+func (c dependencyQueryConnector) Driver() driver.Driver {
+	return dependencyQueryDriver{}
+}
+
+type dependencyQueryDriver struct{}
+
+func (dependencyQueryDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("use dependencyQueryConnector")
+}
+
+type dependencyQueryScript struct {
+	mu        sync.Mutex
+	queries   []string
+	legacyErr error
+	rows      [][]driver.Value
+}
+
+func (s *dependencyQueryScript) Queries() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.queries...)
+}
+
+type dependencyQueryConn struct {
+	script *dependencyQueryScript
+}
+
+func (dependencyQueryConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not implemented")
+}
+
+func (dependencyQueryConn) Close() error {
+	return nil
+}
+
+func (dependencyQueryConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not implemented")
+}
+
+func (c dependencyQueryConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if len(args) != 1 || args[0].Value != "hq-cv-1" {
+		return nil, fmt.Errorf("unexpected query args: %#v", args)
+	}
+
+	c.script.mu.Lock()
+	defer c.script.mu.Unlock()
+	c.script.queries = append(c.script.queries, query)
+
+	if strings.Contains(query, "d.depends_on_id") {
+		return nil, c.script.legacyErr
+	}
+	if strings.Contains(query, "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)") {
+		return &dependencyRows{rows: c.script.rows}, nil
+	}
+	return nil, fmt.Errorf("unexpected query: %s", query)
+}
+
+type dependencyRows struct {
+	rows [][]driver.Value
+	i    int
+}
+
+func (*dependencyRows) Columns() []string {
+	return []string{dependencyTargetAlias}
+}
+
+func (*dependencyRows) Close() error {
+	return nil
+}
+
+func (r *dependencyRows) Next(dest []driver.Value) error {
+	if r.i >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.i])
+	r.i++
+	return nil
 }
 
 func TestResolvePort(t *testing.T) {

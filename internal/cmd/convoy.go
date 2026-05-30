@@ -511,27 +511,20 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 }
 
 func bdDepListRawIDsWithSchema(dir, issueID, direction, depType string, splitTarget bool) ([]string, error) {
-	targetExpr := "depends_on_id"
-	if splitTarget {
-		targetExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)"
-	}
+	targetExpr := beads.DependencyTargetExpr("", splitTarget)
 
 	// Determine query columns based on direction.
 	// "down": issueID depends on targets → SELECT target WHERE issue_id = ?
 	// "up":   issueID is depended on → SELECT issue_id WHERE target = ?
 	selectExpr := targetExpr
-	rowKey := "depends_on_id"
+	rowKey := beads.DependencyTargetAlias
 	whereExpr := fmt.Sprintf("issue_id = '%s'", issueID)
 	if direction == "up" {
 		selectExpr = "issue_id"
 		rowKey = "issue_id"
-		if splitTarget {
-			whereExpr = fmt.Sprintf("'%s' IN (depends_on_issue_id, depends_on_wisp_id, depends_on_external)", issueID)
-		} else {
-			whereExpr = fmt.Sprintf("%s = '%s'", targetExpr, issueID)
-		}
+		whereExpr = beads.DependencyTargetMatchExpr("", fmt.Sprintf("'%s'", issueID), splitTarget)
 	} else if splitTarget {
-		selectExpr = targetExpr + " AS depends_on_id"
+		selectExpr = beads.DependencyTargetSelectExpr("", splitTarget)
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM dependencies WHERE %s", selectExpr, whereExpr)
@@ -564,15 +557,7 @@ func bdDepListRawIDsWithSchema(dir, issueID, direction, depType string, splitTar
 }
 
 func isDependencyTargetColumnError(err error) bool {
-	msg := strings.ToLower(err.Error())
-	missingColumn := strings.Contains(msg, "unknown column") ||
-		strings.Contains(msg, "could not be found") ||
-		strings.Contains(msg, "no such column")
-	return missingColumn &&
-		(strings.Contains(msg, "depends_on_id") ||
-			strings.Contains(msg, "depends_on_issue_id") ||
-			strings.Contains(msg, "depends_on_wisp_id") ||
-			strings.Contains(msg, "depends_on_external"))
+	return beads.IsDependencyTargetColumnError(err)
 }
 
 // isValidBeadID checks that a string is safe for SQL interpolation in dep queries.
