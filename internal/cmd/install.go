@@ -143,11 +143,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			"Use --force to override (not recommended).", absPath, existingRoot)
 	}
 
-	// Ensure beads (bd) is available before proceeding
 	if !installNoBeads {
-		if err := deps.EnsureBeads(true); err != nil {
-			return fmt.Errorf("beads dependency check failed: %w", err)
-		}
 		if err := ensureInstallDoltReady(); err != nil {
 			return err
 		}
@@ -193,6 +189,12 @@ func runInstall(cmd *cobra.Command, args []string) error {
 				}
 				return fmt.Errorf("%s", msg)
 			}
+		}
+
+		// Ensure beads (bd) is available after Dolt preflights but before
+		// creating files, so install recovery errors remain specific and retryable.
+		if err := deps.EnsureBeads(true); err != nil {
+			return fmt.Errorf("beads dependency check failed: %w", err)
 		}
 	}
 

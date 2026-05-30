@@ -44,6 +44,48 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
+func TestCheckBeadsVersionString(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    BeadsStatus
+	}{
+		{
+			name:    "below minimum is too old",
+			version: "1.0.3",
+			want:    BeadsTooOld,
+		},
+		{
+			name:    "minimum is accepted",
+			version: MinBeadsVersion,
+			want:    BeadsOK,
+		},
+		{
+			name:    "maximum is accepted",
+			version: MaxBeadsVersion,
+			want:    BeadsOK,
+		},
+		{
+			name:    "above maximum is too new",
+			version: "1.0.5",
+			want:    BeadsTooNew,
+		},
+		{
+			name:    "future minor is too new",
+			version: "1.1.0",
+			want:    BeadsTooNew,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CheckBeadsVersionString(tt.version); got != tt.want {
+				t.Fatalf("CheckBeadsVersionString(%q) = %v, want %v", tt.version, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCheckBeads(t *testing.T) {
 	// This test depends on whether bd is installed in the test environment
 	status, version := CheckBeads()

@@ -18,9 +18,14 @@ import (
 // Update this when Gas Town requires new beads features.
 const MinBeadsVersion = "1.0.4"
 
+// MaxBeadsVersion is the newest beads version this Gas Town release is known
+// to support. Newer bd releases can change the Dolt schema before Gastown has
+// been updated for it, so fail fast instead of surfacing late SQL errors.
+const MaxBeadsVersion = "1.0.4"
+
 // BeadsInstallPath is the go install path for the bd version compatible with
 // this Gas Town release.
-const BeadsInstallPath = "github.com/steveyegge/beads/cmd/bd@v1.0.4"
+const BeadsInstallPath = "github.com/steveyegge/beads/cmd/bd@v" + MaxBeadsVersion
 
 // BeadsStatus represents the state of the beads installation.
 type BeadsStatus int
@@ -29,6 +34,7 @@ const (
 	BeadsOK       BeadsStatus = iota // bd found, version compatible
 	BeadsNotFound                    // bd not in PATH
 	BeadsTooOld                      // bd found but version too old
+	BeadsTooNew                      // bd found but version is newer than supported
 	BeadsUnknown                     // bd found but couldn't parse version
 )
 
@@ -59,12 +65,18 @@ func CheckBeads() (BeadsStatus, string) {
 		return BeadsUnknown, ""
 	}
 
-	// Compare versions
-	if CompareVersions(version, MinBeadsVersion) < 0 {
-		return BeadsTooOld, version
-	}
+	return CheckBeadsVersionString(version), version
+}
 
-	return BeadsOK, version
+// CheckBeadsVersionString classifies a parsed bd version for compatibility.
+func CheckBeadsVersionString(version string) BeadsStatus {
+	if CompareVersions(version, MinBeadsVersion) < 0 {
+		return BeadsTooOld
+	}
+	if CompareVersions(version, MaxBeadsVersion) > 0 {
+		return BeadsTooNew
+	}
+	return BeadsOK
 }
 
 // EnsureBeads checks for bd and installs it if missing or outdated.
@@ -86,6 +98,10 @@ func EnsureBeads(autoInstall bool) error {
 	case BeadsTooOld:
 		return fmt.Errorf("beads version %s is too old (minimum: %s)\n\nUpgrade with: go install %s",
 			version, MinBeadsVersion, BeadsInstallPath)
+
+	case BeadsTooNew:
+		return fmt.Errorf("beads version %s is newer than this Gas Town release supports (maximum: %s)\n\nDowngrade with: go install %s",
+			version, MaxBeadsVersion, BeadsInstallPath)
 
 	case BeadsUnknown:
 		// Found bd but couldn't determine version - proceed with warning
@@ -116,6 +132,9 @@ func installBeads() error {
 	}
 	if status == BeadsTooOld {
 		return fmt.Errorf("installed beads %s but minimum required is %s", version, MinBeadsVersion)
+	}
+	if status == BeadsTooNew {
+		return fmt.Errorf("installed beads %s but maximum supported is %s", version, MaxBeadsVersion)
 	}
 
 	fmt.Printf("   ✓ Installed beads %s\n", version)

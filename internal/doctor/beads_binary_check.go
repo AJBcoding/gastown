@@ -7,7 +7,7 @@ import (
 )
 
 // BeadsBinaryCheck verifies that the beads (bd) binary is installed and meets
-// the minimum version requirement. This is an informational check with no
+// the version requirements. This is an informational check with no
 // auto-fix — the user must install or upgrade bd manually.
 type BeadsBinaryCheck struct {
 	BaseCheck
@@ -18,7 +18,7 @@ func NewBeadsBinaryCheck() *BeadsBinaryCheck {
 	return &BeadsBinaryCheck{
 		BaseCheck: BaseCheck{
 			CheckName:        "beads-binary",
-			CheckDescription: "Check that beads (bd) is installed and meets minimum version",
+			CheckDescription: "Check that beads (bd) is installed and meets version requirements",
 			CheckCategory:    CategoryInfrastructure,
 		},
 	}
@@ -38,8 +38,8 @@ func (c *BeadsBinaryCheck) Run(ctx *CheckContext) *CheckResult {
 
 	case deps.BeadsNotFound:
 		return &CheckResult{
-			Name:   c.Name(),
-			Status: StatusError,
+			Name:    c.Name(),
+			Status:  StatusError,
 			Message: "beads (bd) not found in PATH",
 			Details: []string{
 				"The bd CLI is required for beads operations",
@@ -49,13 +49,24 @@ func (c *BeadsBinaryCheck) Run(ctx *CheckContext) *CheckResult {
 
 	case deps.BeadsTooOld:
 		return &CheckResult{
-			Name:   c.Name(),
-			Status: StatusError,
+			Name:    c.Name(),
+			Status:  StatusError,
 			Message: fmt.Sprintf("bd %s is too old (minimum: %s)", version, deps.MinBeadsVersion),
 			Details: []string{
 				fmt.Sprintf("Installed version %s does not meet the minimum requirement of %s", version, deps.MinBeadsVersion),
 			},
 			FixHint: fmt.Sprintf("Upgrade: go install %s", deps.BeadsInstallPath),
+		}
+
+	case deps.BeadsTooNew:
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusError,
+			Message: fmt.Sprintf("bd %s is too new (maximum supported: %s)", version, deps.MaxBeadsVersion),
+			Details: []string{
+				fmt.Sprintf("Installed version %s is newer than this Gas Town release supports (%s)", version, deps.MaxBeadsVersion),
+			},
+			FixHint: fmt.Sprintf("Downgrade: go install %s", deps.BeadsInstallPath),
 		}
 
 	case deps.BeadsUnknown:

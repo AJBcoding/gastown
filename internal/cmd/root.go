@@ -79,6 +79,17 @@ var beadsExemptCommands = map[string]bool{
 	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
 }
 
+// Commands exempt even from the too-new bd hard guard. These paths are either
+// high-frequency UI hooks or emergency controls that must avoid subprocess work.
+var beadsTooNewExemptCommands = map[string]bool{
+	"status-line": true,
+	"signal":      true,
+	"metrics":     true,
+	"estop":       true,
+	"thaw":        true,
+	"heartbeat":   true,
+}
+
 // Commands exempt from the town root branch warning.
 // These are commands that help fix the problem or are diagnostic.
 var branchCheckExemptCommands = map[string]bool{
@@ -130,6 +141,7 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 
 	beadsExempt := isCommandOrAncestorExempt(cmd, beadsExemptCommands)
 	branchExempt := isCommandOrAncestorExempt(cmd, branchCheckExemptCommands)
+	roleCommand := isRoleCommand(cmd)
 
 	// Check for stale binary (warning only, doesn't block)
 	if !beadsExempt {
@@ -147,15 +159,23 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// determine liveness without PID signal probing.
 	touchPolecatHeartbeat()
 
-	// Skip beads check for exempt commands
-	if beadsExempt || isRoleCommand(cmd) {
+	var beadsVersionErr error
+	if !beadsExempt && !roleCommand && !isCommandOrAncestorExempt(cmd, beadsTooNewExemptCommands) {
+		beadsVersionErr = CheckBeadsVersion()
+		if isUnsupportedNewBeadsVersion(beadsVersionErr) {
+			return beadsVersionErr
+		}
+	}
+
+	// Skip warning-only beads checks for exempt commands.
+	if beadsExempt || roleCommand {
 		return nil
 	}
 
-	// Check beads version (non-blocking - warn only)
-	if err := CheckBeadsVersion(); err != nil {
+	// Check beads version (missing/old/unknown is non-blocking - warn only)
+	if beadsVersionErr != nil {
 		fmt.Fprintf(os.Stderr, "\n%s beads (bd) version issue:\n", style.Bold.Render("⚠️  WARNING:"))
-		fmt.Fprintf(os.Stderr, "   %v\n", err)
+		fmt.Fprintf(os.Stderr, "   %v\n", beadsVersionErr)
 		fmt.Fprintf(os.Stderr, "   Run %s for details.\n\n", style.Dim.Render("gt doctor"))
 	}
 	return nil

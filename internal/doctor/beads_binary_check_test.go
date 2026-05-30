@@ -18,7 +18,7 @@ func TestBeadsBinaryCheck_Metadata(t *testing.T) {
 	if check.Name() != "beads-binary" {
 		t.Errorf("Name() = %q, want %q", check.Name(), "beads-binary")
 	}
-	if check.Description() != "Check that beads (bd) is installed and meets minimum version" {
+	if check.Description() != "Check that beads (bd) is installed and meets version requirements" {
 		t.Errorf("Description() = %q", check.Description())
 	}
 	if check.Category() != CategoryInfrastructure {
@@ -47,8 +47,8 @@ func TestBeadsBinaryCheck_BdInstalled(t *testing.T) {
 			t.Errorf("expected version string in message, got %q", result.Message)
 		}
 	case StatusError:
-		if !strings.Contains(result.Message, "too old") {
-			t.Errorf("expected 'too old' in error message, got %q", result.Message)
+		if !strings.Contains(result.Message, "too old") && !strings.Contains(result.Message, "too new") {
+			t.Errorf("expected version error message, got %q", result.Message)
 		}
 	default:
 		t.Errorf("unexpected status %v when bd is installed: %s", result.Status, result.Message)
@@ -140,6 +140,38 @@ func TestBeadsBinaryCheck_BdTooOld(t *testing.T) {
 		}
 		if result.FixHint == "" {
 			t.Error("expected a fix hint with upgrade instructions")
+		}
+	case StatusWarning:
+		// Under heavy CI load the fake bd may time out; tolerate gracefully.
+		t.Logf("fake bd timed out under load (got StatusWarning); skipping assertion")
+	default:
+		t.Errorf("expected StatusError (or StatusWarning under load), got %v: %s", result.Status, result.Message)
+	}
+}
+
+func TestBeadsBinaryCheck_BdTooNew(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeFakeBd(t, fakeDir,
+		"#!/bin/sh\necho 'bd version 999.0.0'\n",
+		"@echo off\r\necho bd version 999.0.0\r\n",
+	)
+
+	t.Setenv("PATH", fakeDir)
+
+	check := NewBeadsBinaryCheck()
+	ctx := &CheckContext{TownRoot: t.TempDir()}
+
+	result := check.Run(ctx)
+	switch result.Status {
+	case StatusError:
+		if !strings.Contains(result.Message, "too new") {
+			t.Errorf("expected 'too new' in message, got %q", result.Message)
+		}
+		if !strings.Contains(result.Message, deps.MaxBeadsVersion) {
+			t.Errorf("expected max version in message, got %q", result.Message)
+		}
+		if !strings.Contains(result.FixHint, "Downgrade") {
+			t.Errorf("expected downgrade fix hint, got %q", result.FixHint)
 		}
 	case StatusWarning:
 		// Under heavy CI load the fake bd may time out; tolerate gracefully.
