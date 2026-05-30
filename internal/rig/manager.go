@@ -577,8 +577,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Check if source repo has tracked .beads/ directory.
 	// If so, we need to initialize the database (it doesn't exist after clone since DB files are gitignored).
 	sourceBeadsDir := filepath.Join(mayorRigPath, ".beads")
+	trackedSourceBeadsDir := ""
 	restoreSourceBeadsConfig := func() error { return nil }
 	if _, err := os.Stat(sourceBeadsDir); err == nil {
+		trackedSourceBeadsDir = sourceBeadsDir
+		if err := EnsureTrackedBeadsRuntimeGitExcludes(sourceBeadsDir); err != nil {
+			fmt.Printf("  Warning: Could not update local git excludes for tracked beads: %v\n", err)
+		}
+
 		// Remove any redirect file that might have been accidentally tracked.
 		// Redirect files are runtime/local config and should not be in git.
 		// If not removed, they can cause circular redirect warnings during rig setup.
@@ -612,71 +618,6 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			// Detection failed (no issues yet) - use derived/provided prefix
 			fmt.Printf("  Using prefix '%s' for tracked beads (no existing issues to detect from)\n", opts.BeadsPrefix)
 		}
-
-		// Initialize bd database if runtime files are missing.
-		// DB files are gitignored so they won't exist after clone — bd init creates them.
-		// bd init --prefix will create the database on the Dolt server.
-		//
-		// Note: bdDatabaseExists checks for metadata.json which is tracked in git.
-		// When metadata.json exists but the Dolt server database doesn't (fresh clone
-		// to a new workspace), we still need to run bd init to create the server-side
-		// database and set issue_prefix. Always ensure issue_prefix is set afterward.
-		sourceBdEnv := bdSubprocessEnv(sourceBeadsDir, opts.Name)
-		if !bdDatabaseExists(sourceBeadsDir) {
-			initArgs := []string{"init"}
-			if opts.BeadsPrefix != "" {
-				initArgs = append(initArgs, "--prefix", opts.BeadsPrefix)
-			}
-			if opts.Name != "" {
-				initArgs = append(initArgs, "--database", opts.Name)
-			}
-			initArgs = append(initArgs, "--server")
-			// Always pass --server-port so bd connects to gt's central Dolt
-			// server. Without this, bd auto-starts its own server on a random
-			// port, causing "database not found" errors. (GH #2405)
-			doltCfg := doltserver.DefaultConfig(m.townRoot)
-			initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
-			// If the cloned repo's config.yaml has sync.remote, bd init blocks
-			// waiting for interactive confirmation (stdin is /dev/null here).
-			// Pass explicit flags to bypass the safety check. (GH #3873)
-			if beadsConfigHasSyncRemote(sourceBeadsConfig) {
-				initArgs = append(initArgs,
-					"--reinit-local",
-					"--discard-remote",
-					"--destroy-token=DESTROY-"+opts.BeadsPrefix,
-				)
-			}
-			cmd := exec.Command("bd", initArgs...)
-			cmd.Dir = mayorRigPath
-			cmd.Env = sourceBdEnv
-			if output, err := cmd.CombinedOutput(); err != nil {
-				fmt.Printf("  Warning: Could not init bd database: %v (%s)\n", err, strings.TrimSpace(string(output)))
-			}
-			// Drop orphan databases created by bd init (gh#3562, gt-sv1h).
-			// See dropRigOrphanDBs for naming details across bd versions.
-			if err := dropRigOrphanDBs(m.townRoot, opts.BeadsPrefix, opts.Name); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: orphan database cleanup: %v\n", err)
-			}
-		}
-
-		// Always ensure issue_prefix and custom types are configured, even when
-		// metadata.json was tracked in git (bdDatabaseExists returned true).
-		// The tracked metadata.json tells bd HOW to connect but doesn't guarantee
-		// the server-side database has issue_prefix set for this workspace.
-		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-		configCmd.Dir = mayorRigPath
-		configCmd.Env = sourceBdEnv
-		_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
-
-		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
-		prefixSetCmd.Dir = mayorRigPath
-		prefixSetCmd.Env = sourceBdEnv
-		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
-			fmt.Printf("  Warning: Could not set issue_prefix: %v (%s)\n", prefixErr, strings.TrimSpace(string(prefixOutput)))
-		}
-		if err := restoreSourceBeadsConfig(); err != nil {
-			return nil, err
-		}
 	}
 
 	// NOTE: No per-directory CLAUDE.md/AGENTS.md is created for any agent.
@@ -691,6 +632,11 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			if _, _, err := doltserver.InitRig(m.townRoot, opts.Name); err != nil {
 				fmt.Printf("  Warning: Could not create rig database: %v\n", err)
 			}
+		}
+	}
+	if trackedSourceBeadsDir != "" && !opts.SkipDoltCheck {
+		if err := importTrackedBeadsJSONL(trackedSourceBeadsDir); err != nil {
+			fmt.Printf("  Warning: Could not import tracked beads issues: %v\n", err)
 		}
 	}
 
@@ -924,6 +870,11 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	}
 	if err := restoreSourceBeadsConfig(); err != nil {
 		return nil, err
+	}
+	if trackedSourceBeadsDir != "" {
+		if err := CleanupTrackedBeadsRuntimeArtifacts(trackedSourceBeadsDir); err != nil {
+			fmt.Printf("  Warning: Could not clean tracked beads runtime artifacts: %v\n", err)
+		}
 	}
 
 	// Create plugin directories
@@ -1160,6 +1111,198 @@ func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
 			rigName, prefix, strings.Join(failures, "; "))
 	}
 	return nil
+}
+
+// InitTrackedBeadsDatabase prepares a git-tracked .beads directory for use with
+// Gas Town's centralized Dolt server without running bd init in the user
+// worktree. bd@1.0.x may auto-commit or stage exported files during init, so
+// rig setup uses direct Dolt database/schema/config operations and imports the
+// tracked JSONL export explicitly.
+func (m *Manager) InitTrackedBeadsDatabase(beadsDir, prefix, rigName string) error {
+	if !isValidBeadsPrefix(prefix) {
+		return fmt.Errorf("invalid beads prefix %q: must be alphanumeric with optional hyphens, start with letter, max 20 chars", prefix)
+	}
+	if beadsDir == "" {
+		return fmt.Errorf("beads directory is required")
+	}
+	if rigName == "" {
+		return fmt.Errorf("rig name is required")
+	}
+
+	if _, err := os.Stat(beadsDir); err != nil {
+		return fmt.Errorf("checking tracked beads directory: %w", err)
+	}
+
+	if _, _, err := doltserver.InitRig(m.townRoot, rigName); err != nil {
+		return fmt.Errorf("creating rig database: %w", err)
+	}
+
+	if beads.ConfigYAMLIsGitTracked(beadsDir) {
+		if err := beads.EnsureConfigYAMLIfMissing(beadsDir, prefix); err != nil {
+			return fmt.Errorf("ensuring tracked beads config: %w", err)
+		}
+	} else if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
+		return fmt.Errorf("ensuring beads config: %w", err)
+	}
+
+	if err := doltserver.EnsureMetadataForBeadsDir(m.townRoot, beadsDir, rigName, rigName); err != nil {
+		return fmt.Errorf("ensuring metadata.json: %w", err)
+	}
+	if err := beads.EnsureSchemaMigrated(beadsDir); err != nil {
+		return fmt.Errorf("migrating beads schema: %w", err)
+	}
+	if err := doltserver.SetBeadsConfigValues(m.townRoot, rigName, map[string]string{
+		"issue_prefix": prefix,
+		"types.custom": constants.BeadsCustomTypes,
+	}); err != nil {
+		return fmt.Errorf("setting beads config: %w", err)
+	}
+	if err := importTrackedBeadsJSONL(beadsDir); err != nil {
+		return err
+	}
+	if err := dropRigOrphanDBs(m.townRoot, prefix, rigName); err != nil {
+		return err
+	}
+	return nil
+}
+
+func importTrackedBeadsJSONL(beadsDir string) error {
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	info, err := os.Stat(issuesPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking tracked issues export: %w", err)
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return nil
+	}
+
+	cmd := exec.Command("bd", "--json", "-q", "import", issuesPath)
+	cmd.Dir = filepath.Dir(beadsDir)
+	cmd.Env = beads.BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
+	util.SetDetachedProcessGroup(cmd)
+	snapshot := beads.SnapshotTrackedConfigYAML(beadsDir)
+	output, err := cmd.CombinedOutput()
+	restoreErr := beads.RestoreTrackedConfigYAML(snapshot)
+	if err != nil {
+		importErr := fmt.Errorf("bd import %s: %s: %w", issuesPath, strings.TrimSpace(string(output)), err)
+		if restoreErr != nil {
+			return errors.Join(importErr, fmt.Errorf("restoring tracked config.yaml in %s: %w", beadsDir, restoreErr))
+		}
+		return importErr
+	}
+	if restoreErr != nil {
+		return fmt.Errorf("restoring tracked config.yaml in %s: %w", beadsDir, restoreErr)
+	}
+	return nil
+}
+
+// CleanupTrackedBeadsRuntimeArtifacts removes bd runtime files that may be
+// created next to git-tracked beads metadata during schema/config operations.
+// These files are local cache/state, not project data.
+func CleanupTrackedBeadsRuntimeArtifacts(beadsDir string) error {
+	if beadsDir == "" || !beads.ConfigYAMLIsGitTracked(beadsDir) {
+		return nil
+	}
+
+	var firstErr error
+	for _, name := range []string{".local_version", "export-state.json"} {
+		err := os.Remove(filepath.Join(beadsDir, name))
+		if err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// EnsureTrackedBeadsRuntimeGitExcludes adds local-only git excludes for bd
+// runtime files created next to tracked .beads metadata. The exclude file lives
+// in .git/info/exclude, so this does not modify the user's tracked repository.
+func EnsureTrackedBeadsRuntimeGitExcludes(beadsDir string) error {
+	if beadsDir == "" || !beads.ConfigYAMLIsGitTracked(beadsDir) {
+		return nil
+	}
+
+	worktreeDir := filepath.Dir(beadsDir)
+	out, err := exec.Command("git", "-C", worktreeDir, "rev-parse", "--git-path", "info/exclude").Output()
+	if err != nil {
+		return fmt.Errorf("locating git exclude file: %w", err)
+	}
+	excludePath := strings.TrimSpace(string(out))
+	if excludePath == "" {
+		return fmt.Errorf("git exclude path is empty")
+	}
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(worktreeDir, excludePath)
+	}
+
+	relBeadsDir, err := filepath.Rel(worktreeDir, beadsDir)
+	if err != nil {
+		return fmt.Errorf("resolving beads path: %w", err)
+	}
+	relBeadsDir = filepath.ToSlash(relBeadsDir)
+	patterns := []string{
+		relBeadsDir + "/.local_version",
+		relBeadsDir + "/dolt-server.port",
+		relBeadsDir + "/dolt-access.lock",
+		relBeadsDir + "/export-state.json",
+		relBeadsDir + "/last-touched",
+		relBeadsDir + "/sync-state.json",
+		relBeadsDir + "/bd.sock",
+		relBeadsDir + "/daemon.lock",
+		relBeadsDir + "/daemon.log",
+		relBeadsDir + "/daemon.pid",
+		relBeadsDir + "/.locks/",
+		relBeadsDir + "/mq/",
+	}
+
+	var existing string
+	if data, err := os.ReadFile(excludePath); err == nil {
+		existing = string(data)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading git exclude file: %w", err)
+	}
+
+	var additions []string
+	for _, pattern := range patterns {
+		if !gitExcludeContains(existing, pattern) {
+			additions = append(additions, pattern)
+		}
+	}
+	if len(additions) == 0 {
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0755); err != nil {
+		return fmt.Errorf("creating git info directory: %w", err)
+	}
+	f, err := os.OpenFile(excludePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644) //nolint:gosec // git exclude files are normally user-readable
+	if err != nil {
+		return fmt.Errorf("opening git exclude file: %w", err)
+	}
+	defer f.Close()
+	if existing != "" && !strings.HasSuffix(existing, "\n") {
+		if _, err := f.WriteString("\n"); err != nil {
+			return fmt.Errorf("normalizing git exclude file: %w", err)
+		}
+	}
+	for _, pattern := range additions {
+		if _, err := f.WriteString(pattern + "\n"); err != nil {
+			return fmt.Errorf("writing git exclude pattern: %w", err)
+		}
+	}
+	return nil
+}
+
+func gitExcludeContains(content, pattern string) bool {
+	for _, line := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		if strings.TrimSpace(line) == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 // InitBeads initializes the beads database at rig level.
@@ -1575,50 +1718,15 @@ func isStandardBeadHash(s string) bool {
 	return true
 }
 
-// bdDatabaseExists checks if a beads directory has an initialized database
-// that is actually usable (not just tracked metadata from another workspace).
-//
-// For Dolt server mode, metadata.json may be tracked in git with dolt_database
-// pointing to a database that doesn't exist on this Dolt server. In that case,
-// we need to run bd init to create the server-side database.
-func bdDatabaseExists(beadsDir string) bool {
-	metadataPath := filepath.Join(beadsDir, "metadata.json")
-	data, err := os.ReadFile(metadataPath)
-	if err != nil {
-		return false
-	}
-
-	// Parse metadata to check if the referenced Dolt database actually exists.
-	var meta struct {
-		DoltMode     string `json:"dolt_mode"`
-		DoltDatabase string `json:"dolt_database"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return true // Can't parse — assume it exists (backward compat)
-	}
-
-	// For server mode, verify the database exists in .dolt-data/.
-	// metadata.json may be tracked in git from another workspace where
-	// the Dolt server had this database, but this is a fresh server.
-	if meta.DoltMode == "server" && meta.DoltDatabase != "" {
-		// Walk up from beadsDir to find the town root (.dolt-data lives there).
-		townRoot := beads.FindTownRoot(filepath.Dir(beadsDir))
-		if townRoot == "" {
-			return true // Can't find town root — assume it exists
-		}
-		dbDir := filepath.Join(townRoot, ".dolt-data", meta.DoltDatabase)
-		if _, err := os.Stat(dbDir); os.IsNotExist(err) {
-			return false // Database doesn't exist on this server
-		}
-	}
-
-	return true
+// DetectBeadsPrefixFromConfig reads the beads prefix from a config.yaml file.
+// When adding a rig from a source repo that has .beads/ tracked in git (like a
+// project that already uses beads for issue tracking), callers need to use that
+// project's existing prefix instead of generating a new one. Otherwise, the rig
+// would have a mismatched prefix and routing would fail to find existing issues.
+func DetectBeadsPrefixFromConfig(configPath string) string {
+	return detectBeadsPrefixFromConfig(configPath)
 }
 
-// When adding a rig from a source repo that has .beads/ tracked in git (like a project
-// that already uses beads for issue tracking), we need to use that project's existing
-// prefix instead of generating a new one. Otherwise, the rig would have a mismatched
-// prefix and routing would fail to find the existing issues.
 func detectBeadsPrefixFromConfig(configPath string) string {
 	data, err := os.ReadFile(configPath)
 	if err != nil {

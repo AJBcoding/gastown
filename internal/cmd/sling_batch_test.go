@@ -948,6 +948,12 @@ exit 0
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
 
+	oldAddTracking := addTrackingRelationFn
+	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
+		return nil
+	}
+	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
+
 	_, err := createAutoConvoy("gt-aaa", "My task", true, "direct", "")
 	if err != nil {
 		t.Fatalf("createAutoConvoy() error: %v", err)
@@ -995,6 +1001,12 @@ exit 0
 	if err := os.WriteFile(filepath.Join(townRoot, "bin", "bd"), []byte(bdScript), 0755); err != nil {
 		t.Fatalf("rewrite bd stub: %v", err)
 	}
+
+	oldAddTracking := addTrackingRelationFn
+	addTrackingRelationFn = func(townRoot, convoyID, issueID string) error {
+		return fmt.Errorf("tracking failed")
+	}
+	t.Cleanup(func() { addTrackingRelationFn = oldAddTracking })
 
 	convoyID, err := createAutoConvoy("gt-aaa", "My task", false, "", "")
 	if err != nil {

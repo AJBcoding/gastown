@@ -2136,7 +2136,13 @@ if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
   exit 9
 fi
 case "$cmd" in
-  version|update|config|reopen)
+  config)
+    if [ "${2:-}" = "get" ] && [ "${3:-}" = "types.custom" ]; then
+      printf '%%s\n' 'agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request'
+    fi
+    exit 0
+    ;;
+  version|update|reopen|migrate)
     exit 0
     ;;
   create)

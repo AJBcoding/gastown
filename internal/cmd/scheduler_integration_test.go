@@ -75,6 +75,7 @@ func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string, requirePref
 	// bd v1.0.0+ defaults to embedded mode; --server is required to use an
 	// external server (v0.57.0 defaulted to server mode and ignored --server).
 	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		ensureSchedulerDoltDatabase(t, prefix, p)
 		args = append(args, "--server", "--server-port", p)
 	}
 	var out []byte
@@ -88,7 +89,7 @@ func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string, requirePref
 				t.Fatalf("mkdir .beads in %s before retry: %v", dir, mkdirErr)
 			}
 		}
-		out, err = runSchedulerCombinedOutput("bd", args, dir, schedulerBDEnvWithHome(dir, homeDir, true), schedulerBDInitTimeout)
+		out, err = runSchedulerCombinedOutput("bd", args, dir, schedulerBDInitEnv(homeDir), schedulerBDInitTimeout)
 		t.Logf("bd init --prefix %s in %s attempt %d: exit=%v\n%s", prefix, dir, attempt, err, out)
 		if err == nil || !isSchedulerCommandTimeout(err) {
 			break
@@ -137,6 +138,41 @@ func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string, requirePref
 	if err := beads.EnsureCustomTypes(beadsDir); err != nil {
 		t.Fatalf("ensure custom types in %s: %v", dir, err)
 	}
+}
+
+func schedulerBDInitEnv(homeDir string) []string {
+	// bd init must discover the target .beads directory from the working
+	// directory. Pinning BEADS_DIR before metadata.json exists makes bd v1.0.0
+	// lose the server database selected by --prefix.
+	env := beads.SuppressBDSideEffects(cleanSchedulerTestEnv(homeDir))
+	return append(env, "BD_DOLT_AUTO_COMMIT=on")
+}
+
+func ensureSchedulerDoltDatabase(t *testing.T, name, port string) {
+	t.Helper()
+
+	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("connect to Dolt server to create %s: %v", name, err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("ping Dolt server to create %s: %v", name, err)
+	}
+	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS `" + name + "`"); err != nil {
+		t.Fatalf("create Dolt database %s: %v", name, err)
+	}
+
+	var useErr error
+	for attempt := 0; attempt < 20; attempt++ {
+		if _, useErr = db.Exec("USE `" + name + "`"); useErr == nil {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("Dolt database %s not visible after create: %v", name, useErr)
 }
 
 func initNestedRigBeadsDBForServer(t *testing.T, rigPath, prefix, homeDir string) {

@@ -1199,46 +1199,44 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		filepath.Join(rigPath, "mayor", "rig", ".beads"),
 	}
 	foundBeadsCandidate := false
+	trackedBeadsDir := ""
 	for _, beadsDir := range beadsDirCandidates {
 		if _, err := os.Stat(beadsDir); err != nil {
 			continue
 		}
 		foundBeadsCandidate = true
+		trackedBeadsDir = beadsDir
+		if err := rig.EnsureTrackedBeadsRuntimeGitExcludes(beadsDir); err != nil {
+			fmt.Printf("  %s Could not update local git excludes for tracked beads: %v\n", style.Warning.Render("!"), err)
+		}
 
-		// Detect prefix from Dolt metadata: try "bd config get issue_prefix" first,
-		// then extract from metadata.json dolt_database name as fallback.
-		// metadata.json survives clone (dolt/ is gitignored since bd v0.50+).
 		prefixDetected := false
-		metadataPath := filepath.Join(beadsDir, "metadata.json")
-		if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
-			var meta struct {
-				Backend string `json:"backend"`
+		if detected := rig.DetectBeadsPrefixFromConfig(filepath.Join(beadsDir, "config.yaml")); detected != "" {
+			if rigAddPrefix != "" && strings.TrimSuffix(rigAddPrefix, "-") != detected {
+				return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
 			}
-			if json.Unmarshal(metaBytes, &meta) == nil && meta.Backend == "dolt" {
-				workDir := filepath.Dir(beadsDir)
-				bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
-				bdCmd.Dir = workDir
-				if out, bdErr := bdCmd.Output(); bdErr == nil {
-					detected := strings.TrimSpace(string(out))
-					if detected != "" {
-						if rigAddPrefix != "" && strings.TrimSuffix(rigAddPrefix, "-") != detected {
-							return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
-						}
-						if result.BeadsPrefix == "" {
-							result.BeadsPrefix = detected
-						}
-						prefixDetected = true
-					}
+			if rigAddPrefix == "" {
+				result.BeadsPrefix = detected
+			}
+			prefixDetected = true
+		}
+
+		// Detect prefix from Dolt metadata when config.yaml was not enough: try
+		// "bd config get issue_prefix" first, then extract from metadata.json
+		// dolt_database name as fallback. metadata.json survives clone (dolt/ is
+		// gitignored since bd v0.50+).
+		metadataPath := filepath.Join(beadsDir, "metadata.json")
+		if !prefixDetected {
+			if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
+				var meta struct {
+					Backend string `json:"backend"`
 				}
-				// Fallback: extract prefix from dolt_database name in metadata.json.
-				// Format: "beads_<prefix>" (e.g. "beads_my_project" → "my_project").
-				// This survives clone because metadata.json is tracked by git.
-				if !prefixDetected {
-					var fullMeta struct {
-						DoltDatabase string `json:"dolt_database"`
-					}
-					if json.Unmarshal(metaBytes, &fullMeta) == nil && strings.HasPrefix(fullMeta.DoltDatabase, "beads_") {
-						detected := strings.TrimPrefix(fullMeta.DoltDatabase, "beads_")
+				if json.Unmarshal(metaBytes, &meta) == nil && meta.Backend == "dolt" {
+					workDir := filepath.Dir(beadsDir)
+					bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
+					bdCmd.Dir = workDir
+					if out, bdErr := bdCmd.Output(); bdErr == nil {
+						detected := strings.TrimSpace(string(out))
 						if detected != "" {
 							if rigAddPrefix != "" && strings.TrimSuffix(rigAddPrefix, "-") != detected {
 								return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
@@ -1249,45 +1247,45 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 							prefixDetected = true
 						}
 					}
+					// Fallback: extract prefix from dolt_database name in metadata.json.
+					// Format: "beads_<prefix>" (e.g. "beads_my_project" → "my_project").
+					// This survives clone because metadata.json is tracked by git.
+					if !prefixDetected {
+						var fullMeta struct {
+							DoltDatabase string `json:"dolt_database"`
+						}
+						if json.Unmarshal(metaBytes, &fullMeta) == nil && strings.HasPrefix(fullMeta.DoltDatabase, "beads_") {
+							detected := strings.TrimPrefix(fullMeta.DoltDatabase, "beads_")
+							if detected != "" {
+								if rigAddPrefix != "" && strings.TrimSuffix(rigAddPrefix, "-") != detected {
+									return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
+								}
+								if result.BeadsPrefix == "" {
+									result.BeadsPrefix = detected
+								}
+								prefixDetected = true
+							}
+						}
+					}
 				}
 			}
 		}
 
-		// Re-init database if metadata.json is missing or dolt/ directory is missing.
-		// Since bd v0.50+, dolt/ is gitignored and won't exist after clone.
-		// Use mgr.InitBeads() for consistency with the non-adopt path — it handles
-		// BEADS_DIR env isolation, prefix validation, custom types config, tracked-beads
-		// redirect, and fallback config creation.
-		metadataPath = filepath.Join(beadsDir, "metadata.json")
-		needsInit := false
-		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-			needsInit = true
-		} else if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
-			var meta struct {
-				Backend string `json:"backend"`
-			}
-			if json.Unmarshal(metaBytes, &meta) == nil && meta.Backend == "dolt" {
-				doltDir := filepath.Join(beadsDir, "dolt")
-				if _, statErr := os.Stat(doltDir); os.IsNotExist(statErr) {
-					needsInit = true
-				}
-			}
+		prefix := result.BeadsPrefix
+		if prefix == "" {
+			break
 		}
-		if needsInit {
-			prefix := result.BeadsPrefix
-			if prefix == "" {
-				break
-			}
-			// Dolt server is required for beads init.
-			if running, _, sErr := doltserver.IsRunning(townRoot); sErr != nil || !running {
-				fmt.Printf("  %s Could not init bd database: Dolt server is not running\n", style.Warning.Render("!"))
-				break
-			}
-			if err := mgr.InitBeads(rigPath, prefix, name); err != nil {
-				fmt.Printf("  %s Could not init bd database: %v\n", style.Warning.Render("!"), err)
-			} else {
-				fmt.Printf("  %s Initialized beads database (Dolt)\n", style.Success.Render("✓"))
-			}
+		// Dolt server is required for tracked beads initialization. Use direct
+		// database/schema/config setup rather than bd init so bd@1.0.x cannot
+		// auto-commit or stage files in the adopted repo.
+		if running, _, sErr := doltserver.IsRunning(townRoot); sErr != nil || !running {
+			fmt.Printf("  %s Could not init bd database: Dolt server is not running\n", style.Warning.Render("!"))
+			break
+		}
+		if err := mgr.InitTrackedBeadsDatabase(beadsDir, prefix, name); err != nil {
+			fmt.Printf("  %s Could not init bd database: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  %s Initialized beads database (Dolt)\n", style.Success.Render("✓"))
 		}
 		break
 	}
@@ -1355,6 +1353,11 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			} else {
 				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), refineryID)
 			}
+		}
+	}
+	if trackedBeadsDir != "" {
+		if err := rig.CleanupTrackedBeadsRuntimeArtifacts(trackedBeadsDir); err != nil {
+			fmt.Printf("  %s Could not clean tracked beads runtime artifacts: %v\n", style.Warning.Render("!"), err)
 		}
 	}
 

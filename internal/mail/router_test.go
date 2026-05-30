@@ -390,7 +390,7 @@ func TestSendFromCrewWorkspace_AvoidsEphemeralPrefixMismatch(t *testing.T) {
 	script := `#!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${1:-}" == "config" || "${1:-}" == "init" ]]; then
+if [[ "${1:-}" == "config" || "${1:-}" == "init" || "${1:-}" == "migrate" ]]; then
   exit 0
 fi
 

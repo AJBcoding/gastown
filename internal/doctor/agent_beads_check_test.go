@@ -247,6 +247,11 @@ case "$cmd" in
     printf 'create %s\n' "$id" >> "$logfile"
     printf '{"id":"%s","title":"%s","status":"open","labels":["gt:agent"]}\n' "$id" "$title"
     ;;
+  config)
+    if [[ "${rest[0]:-}" == "get" && "${rest[1]:-}" == "types.custom" ]]; then
+      printf 'agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merge-request\n'
+    fi
+    ;;
   update)
     if [[ ${#rest[@]} -gt 0 ]]; then
       printf 'update %s\n' "${rest[0]}" >> "$logfile"

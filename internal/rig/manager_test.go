@@ -1981,20 +1981,18 @@ func TestBeadsConfigHasSyncRemote_MissingFile(t *testing.T) {
 	}
 }
 
-func TestAddRig_TrackedBeadsWithSyncRemote_PassesReinitFlags(t *testing.T) {
+func TestAddRig_TrackedBeadsWithSyncRemote_AvoidsBdInit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based bd shim not reliable on Windows CI")
 	}
 
-	// Fake bd that succeeds on all subcommands and logs bd init args.
+	// Fake bd that succeeds on all subcommands and logs commands.
 	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
 	script := `#!/usr/bin/env bash
 cmd="$1"
 [[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
 shift
-if [[ "$cmd" == "init" ]]; then
-  echo "init $*" >> "$BD_CMD_LOG"
-fi
+echo "$cmd $*" >> "$BD_CMD_LOG"
 case "$cmd" in
   init|migrate) exit 0 ;;
   config)
@@ -2058,32 +2056,25 @@ esac
 		t.Fatalf("reading bd cmd log: %v", err)
 	}
 	cmds := string(logData)
-
-	if !strings.Contains(cmds, "--reinit-local") {
-		t.Errorf("bd init missing --reinit-local; full log:\n%s", cmds)
-	}
-	if !strings.Contains(cmds, "--discard-remote") {
-		t.Errorf("bd init missing --discard-remote; full log:\n%s", cmds)
-	}
-	if !strings.Contains(cmds, "--destroy-token=DESTROY-gt") {
-		t.Errorf("bd init missing --destroy-token=DESTROY-gt; full log:\n%s", cmds)
+	for _, line := range strings.Split(strings.TrimSpace(cmds), "\n") {
+		if line == "init" || strings.HasPrefix(line, "init ") {
+			t.Fatalf("tracked beads setup must not run bd init in the user worktree; full log:\n%s", cmds)
+		}
 	}
 }
 
-func TestAddRig_TrackedBeadsWithoutSyncRemote_NoReinitFlags(t *testing.T) {
+func TestAddRig_TrackedBeadsWithoutSyncRemote_AvoidsBdInit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based bd shim not reliable on Windows CI")
 	}
 
-	// Fake bd that logs bd init args.
+	// Fake bd that logs commands.
 	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
 	script := `#!/usr/bin/env bash
 cmd="$1"
 [[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
 shift
-if [[ "$cmd" == "init" ]]; then
-  echo "init $*" >> "$BD_CMD_LOG"
-fi
+echo "$cmd $*" >> "$BD_CMD_LOG"
 case "$cmd" in
   init|migrate) exit 0 ;;
   config)
@@ -2144,10 +2135,9 @@ esac
 		t.Fatalf("bd init was not logged; no-sync.remote destructive-flag assertion is inconclusive: %v", err)
 	}
 	cmds := string(logData)
-	if strings.Contains(cmds, "--reinit-local") {
-		t.Errorf("bd init should NOT have --reinit-local without sync.remote; got:\n%s", cmds)
-	}
-	if strings.Contains(cmds, "--discard-remote") {
-		t.Errorf("bd init should NOT have --discard-remote without sync.remote; got:\n%s", cmds)
+	for _, line := range strings.Split(strings.TrimSpace(cmds), "\n") {
+		if line == "init" || strings.HasPrefix(line, "init ") {
+			t.Fatalf("tracked beads setup must not run bd init in the user worktree; full log:\n%s", cmds)
+		}
 	}
 }

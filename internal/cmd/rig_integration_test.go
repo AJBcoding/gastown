@@ -229,6 +229,12 @@ switch ($cmd) {
     exit 0
   }
   'migrate' { exit 0 }
+  'config' {
+    if (($args -join ' ') -match 'get types.custom') {
+      Write-Output 'agent,role,rig,convoy'
+    }
+    exit 0
+  }
   'show' {
     [Console]::Error.WriteLine('{"error":"not found"}')
     exit 1
@@ -298,6 +304,12 @@ case "$cmd" in
     exit 0
     ;;
   migrate)
+    exit 0
+    ;;
+  config)
+    if echo " $* " | grep -q " get types.custom"; then
+      echo "agent,role,rig,convoy"
+    fi
     exit 0
     ;;
   show)

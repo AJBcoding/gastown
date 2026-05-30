@@ -92,13 +92,20 @@ func (b *Beads) FindOpenSlingContext(workBeadID string) (*Issue, *capacity.Sling
 
 // ListOpenSlingContexts returns all open sling context beads.
 func (b *Beads) ListOpenSlingContexts() ([]*Issue, error) {
-	out, err := b.run("list",
-		"--label="+capacity.LabelSlingContext,
-		"--status=open",
-		"--include-ephemeral",
-		"--json",
-		"--limit=0",
+	label := strings.ReplaceAll(capacity.LabelSlingContext, "'", "''")
+	query := fmt.Sprintf(
+		"SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, "+
+			"w.created_at, w.updated_at, w.created_by, "+
+			"GROUP_CONCAT(al.label) as labels_csv "+
+			"FROM wisps w "+
+			"JOIN wisp_labels l ON w.id = l.issue_id "+
+			"LEFT JOIN wisp_labels al ON w.id = al.issue_id "+
+			"WHERE w.status = 'open' AND l.label = '%s' "+
+			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by",
+		label,
 	)
+
+	out, err := b.run("sql", "--json", query)
 	if err != nil {
 		return nil, err
 	}
@@ -110,9 +117,40 @@ func (b *Beads) ListOpenSlingContexts() ([]*Issue, error) {
 		return nil, nil
 	}
 
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing sling context list: %w", err)
+	var rows []struct {
+		ID          string `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+		Priority    int    `json:"priority"`
+		Assignee    string `json:"assignee"`
+		CreatedAt   string `json:"created_at"`
+		UpdatedAt   string `json:"updated_at"`
+		CreatedBy   string `json:"created_by"`
+		LabelsCSV   string `json:"labels_csv"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, fmt.Errorf("parsing sling context sql output: %w", err)
+	}
+
+	issues := make([]*Issue, 0, len(rows))
+	for _, row := range rows {
+		issue := &Issue{
+			ID:          row.ID,
+			Title:       row.Title,
+			Description: row.Description,
+			Status:      row.Status,
+			Priority:    row.Priority,
+			Assignee:    row.Assignee,
+			CreatedAt:   row.CreatedAt,
+			UpdatedAt:   row.UpdatedAt,
+			CreatedBy:   row.CreatedBy,
+			Ephemeral:   true,
+		}
+		if row.LabelsCSV != "" {
+			issue.Labels = strings.Split(row.LabelsCSV, ",")
+		}
+		issues = append(issues, issue)
 	}
 
 	return issues, nil

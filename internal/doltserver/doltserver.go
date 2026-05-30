@@ -1340,7 +1340,7 @@ func FindIdleMonitorProcesses(townRoot string) []int {
 func findIdleMonitorProcessesFromPS(output, townRoot, absRoot string, port int) []int {
 	portStr := strconv.Itoa(port)
 	var pids []int
-	for _, line := range strings.Split(string(output), "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.Contains(line, "idle-monitor") {
 			continue
@@ -2651,18 +2651,23 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 	if running {
 		// If the data directory doesn't exist, the server is orphaned (e.g., user
 		// deleted ~/gt and re-ran gt install while an old server was still running).
-		// Stop the orphaned server and fall through to the offline init path.
+		// Stop owned orphaned servers and fall through to the offline init path.
+		// PID 0 means IsRunning only proved TCP reachability (Docker/external
+		// server), so there is no local process to stop and CREATE DATABASE should
+		// be issued against the reachable server.
 		if _, err := os.Stat(config.DataDir); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Warning: Dolt server (PID %d) is running but data directory %s does not exist — stopping orphaned server\n", runningPID, config.DataDir)
-			if stopErr := Stop(townRoot); stopErr != nil {
-				// Force-kill if graceful stop fails (no PID file for orphaned server)
-				if runningPID > 0 {
+			if runningPID > 0 {
+				fmt.Fprintf(os.Stderr, "Warning: Dolt server (PID %d) is running but data directory %s does not exist — stopping orphaned server\n", runningPID, config.DataDir)
+				if stopErr := Stop(townRoot); stopErr != nil {
+					// Force-kill if graceful stop fails (no PID file for orphaned server)
 					if proc, err := os.FindProcess(runningPID); err == nil {
 						_ = proc.Kill()
 					}
 				}
+				running = false
+			} else if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+				return running, false, fmt.Errorf("creating Dolt client working directory: %w", err)
 			}
-			running = false
 		}
 	}
 
