@@ -194,9 +194,12 @@ const (
 	// DefaultBatchSize is the number of rows per batch DELETE operation.
 	DefaultBatchSize = 100
 	// DefaultAlertThreshold is the open-wisp count above which callers should
-	// surface a warning. Sized above the natural steady-state for the current
-	// dog/deacon emit rate (~23 wisps/h × 24h TTL ≈ 550). See hq-57jr8.
-	DefaultAlertThreshold = 800
+	// surface a warning. Original sizing (800) assumed ~23 wisps/h × 24h TTL
+	// ≈ 550 baseline, but observed HQ patrol velocity is ~40 wisps/h, putting
+	// natural steady-state at ~960 — well above 800. Raised to 2000 to give
+	// headroom and stop spurious daily alerts; real fix is per-database
+	// or growth-rate-based sizing per hq-o82zr.
+	DefaultAlertThreshold = 2000
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
