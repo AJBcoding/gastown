@@ -136,8 +136,8 @@ Directory structure:
 For work that should be owned by the target rig:
 
 ```bash
-# Create issue in target rig
-bd create --repo beads "Fix authentication bug"
+# Create issue in target rig (note: must cd into target rig first)
+(cd ~/gt/beads && bd create "Fix authentication bug")
 
 # Create convoy and sling to target rig
 gt convoy create "Auth fix" bd-xyz
