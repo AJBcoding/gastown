@@ -124,9 +124,15 @@ func IsDependencyTargetColumnError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
+	// Different Dolt/MySQL versions phrase this error differently. Patterns
+	// observed in the wild: MySQL "unknown column", older Dolt "could not be
+	// found"/"no such column", current Dolt "does not have column" (gt-c2v
+	// followup: bravo's 2026-05-31 escalation found the last pattern blocked
+	// the reaper across all 16 databases because retry never fired).
 	missingColumn := strings.Contains(msg, "unknown column") ||
 		strings.Contains(msg, "could not be found") ||
-		strings.Contains(msg, "no such column")
+		strings.Contains(msg, "no such column") ||
+		strings.Contains(msg, "does not have column")
 	if !missingColumn {
 		return false
 	}

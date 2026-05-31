@@ -108,13 +108,48 @@ func TestDependencyTargetSplitValuesExprsForWispCopyClassifiesLegacyMigratingTar
 }
 
 func TestIsDependencyTargetColumnError(t *testing.T) {
-	err := errors.New(`query error: column "depends_on_id" could not be found in any table in scope`)
-	if !IsDependencyTargetColumnError(err) {
-		t.Fatal("expected depends_on_id missing-column error to be detected")
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "legacy phrasing: could not be found",
+			err:  errors.New(`query error: column "depends_on_id" could not be found in any table in scope`),
+			want: true,
+		},
+		{
+			name: "mysql phrasing: unknown column",
+			err:  errors.New(`Error 1054 (42S22): Unknown column 'wd.depends_on_id' in 'on clause'`),
+			want: true,
+		},
+		{
+			name: "sqlite-like phrasing: no such column",
+			err:  errors.New("no such column: depends_on_id"),
+			want: true,
+		},
+		{
+			name: "current dolt phrasing: does not have column (bravo 2026-05-31 reaper escalation)",
+			err:  errors.New(`Error 1105 (HY000): table "wd" does not have column "depends_on_id"`),
+			want: true,
+		},
+		{
+			name: "unrelated syntax error",
+			err:  errors.New("syntax error near dependencies"),
+			want: false,
+		},
+		{
+			name: "missing-column error that names a different column",
+			err:  errors.New(`unknown column "foo"`),
+			want: false,
+		},
 	}
-
-	if IsDependencyTargetColumnError(errors.New("syntax error near dependencies")) {
-		t.Fatal("unexpected dependency target column match for unrelated error")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsDependencyTargetColumnError(tc.err); got != tc.want {
+				t.Fatalf("IsDependencyTargetColumnError(%q) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
