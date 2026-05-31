@@ -160,13 +160,18 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` aut
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
-| Polecat/witness/refinery/convoy code | **gastown** | `bd create --repo gastown "..."` |
-| Wyvern game features | **wyvern** | `bd create --repo wyvern "..."` |
+| `bd` CLI (beads tool) | **beads** | `(cd {{ .TownRoot }}/beads && bd create "...")` |
+| `gt` CLI (gas town tool) | **gastown** | `(cd {{ .TownRoot }}/gastown && bd create "...")` |
+| Polecat/witness/refinery/convoy code | **gastown** | `(cd {{ .TownRoot }}/gastown && bd create "...")` |
+| Wyvern game features | **wyvern** | `(cd {{ .TownRoot }}/wyvern && bd create "...")` |
 | Cross-rig coordination, convoys, mail | **HQ** | `bd create "..."` (default) |
 
 **IMPORTANT:** Issues are created with `bd create`, not `gt` commands.
+
+**Do NOT use `bd create --repo <name>`** — the bare-name form is broken in
+upstream `bd` (gt-n0l): it auto-inits a stub `./<name>/.beads` dir and writes
+the bead there, returning a ghost ID. File beads from the target rig's
+directory (the cd-prefixed form above) until upstream is fixed.
 
 **The test**: "Which repo would the fix be committed to?"
 - Fix in `anthropics/beads` → file in beads rig

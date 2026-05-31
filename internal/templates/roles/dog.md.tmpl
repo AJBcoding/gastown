@@ -90,10 +90,15 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. Debug with: `BD_DEBUG_R
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool bugs, features) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool bugs, features) | **gastown** | `bd create --repo gastown "..."` |
-| Dog/deacon/patrol code | **gastown** | `bd create --repo gastown "..."` |
+| `bd` CLI (beads tool bugs, features) | **beads** | `(cd {{ .TownRoot }}/beads && bd create "...")` |
+| `gt` CLI (gas town tool bugs, features) | **gastown** | `(cd {{ .TownRoot }}/gastown && bd create "...")` |
+| Dog/deacon/patrol code | **gastown** | `(cd {{ .TownRoot }}/gastown && bd create "...")` |
 | Cross-rig coordination | **HQ** | `bd create "..."` (default) |
+
+**Do NOT use `bd create --repo <name>`** — the bare-name form is broken in
+upstream `bd` (gt-n0l): it auto-inits a stub `./<name>/.beads` dir and writes
+the bead there, returning a ghost ID. File beads from the target rig's
+directory (the cd-prefixed form above) until upstream is fixed.
 
 ## Key Commands
 

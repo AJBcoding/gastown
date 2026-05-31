@@ -170,9 +170,14 @@ go here by default. But if you discover bugs/issues in OTHER projects:
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
 | This rig's code ({{ .RigName }}) | Here (default) | `bd create "..."` |
-| `bd` CLI (beads tool) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
-| Cross-rig coordination | **HQ** | `bd create --repo hq "..."` |
+| `bd` CLI (beads tool) | **beads** | `(cd {{ .TownRoot }}/beads && bd create "...")` |
+| `gt` CLI (gas town tool) | **gastown** | `(cd {{ .TownRoot }}/gastown && bd create "...")` |
+| Cross-rig coordination | **HQ** | `(cd {{ .TownRoot }} && bd create "...")` |
+
+**Do NOT use `bd create --repo <name>`** — the bare-name form is broken in
+upstream `bd` (gt-n0l): it auto-inits a stub `./<name>/.beads` dir and writes
+the bead there, returning a ghost ID that no reader can find. Until upstream is
+fixed, file beads from the target rig's directory (the cd-prefixed form above).
 
 **The test**: "Which repo would the fix be committed to?"
 
@@ -295,7 +300,7 @@ bd close <id> --reason="no-changes: <explanation>"  # Close without code changes
 # Creating
 bd create --title="Found bug" --type=bug --priority=2    # File discovered work
 bd create --title="Need feature" --type=task             # File task
-bd create --repo beads "bd CLI bug"                      # File in another rig
+(cd {{ .TownRoot }}/beads && bd create "bd CLI bug")     # File in another rig (--repo flag is broken, see gt-n0l)
 ```
 
 **Valid statuses:** `open`, `in_progress`, `blocked`, `deferred`, `closed`, `pinned`, `hooked`
