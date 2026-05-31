@@ -393,8 +393,13 @@ func serverListenIPs(listenAddr string) []net.IP {
 type issueCertRequest struct {
 	// Rig is the rig name (e.g. "MyRig").
 	Rig string `json:"rig"`
-	// Name is the polecat name (e.g. "rust").
+	// Name is the agent name (e.g. "rust").
 	Name string `json:"name"`
+	// Role selects the BD_ACTOR/GT_ROLE prefix the proxy will inject for this
+	// cert: "polecats" → "<rig>/polecats/<name>", "crew" → "<rig>/crew/<name>".
+	// Empty defaults to "polecats" for backwards compatibility — existing
+	// integrations that omit the field continue to receive polecat-scoped certs.
+	Role string `json:"role,omitempty"`
 	// TTL is the certificate validity duration (e.g. "720h"). Defaults to 720h (30 days).
 	TTL string `json:"ttl"`
 }
@@ -432,6 +437,17 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate role early so callers get a clean 400 instead of a downstream
+	// "invalid agent CN" error from IssuePolecat.
+	role := req.Role
+	if role == "" {
+		role = defaultRoleSegment
+	}
+	if _, ok := roleSegments[role]; !ok {
+		http.Error(w, fmt.Sprintf("bad request: invalid role %q: must be one of polecats, crew", req.Role), http.StatusBadRequest)
+		return
+	}
+
 	ttl := 720 * time.Hour // 30 days
 	if req.TTL != "" {
 		parsed, err := time.ParseDuration(req.TTL)
@@ -446,7 +462,13 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		ttl = parsed
 	}
 
+	// Embed role in the CN only when the caller specified it. Omitting role
+	// preserves the legacy "gt-<rig>-<name>" form so existing clients keep
+	// receiving byte-identical CNs after upgrade.
 	cn := "gt-" + req.Rig + "-" + req.Name
+	if req.Role != "" {
+		cn = "gt-" + req.Rig + "-" + role + "-" + req.Name
+	}
 	certPEM, keyPEM, err := s.ca.IssuePolecat(cn, ttl)
 	if err != nil {
 		http.Error(w, "failed to issue certificate: "+err.Error(), http.StatusBadRequest)

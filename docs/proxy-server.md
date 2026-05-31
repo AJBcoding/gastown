@@ -382,7 +382,7 @@ curl -s https://api.ipify.org
 | **Client identity** | Server verifies every request comes from a known polecat | Client cert signed by the same CA; CN format `gt-<rig>-<name>` required |
 | **Exec allowlist** | Containers can only call `gt` and `bd` (or the configured set) | `--allowed-cmds` checked on every `/v1/exec` request |
 | **Subcommand allowlist** | Polecats may only invoke permitted subcommands of `gt`/`bd` | `--allowed-subcmds` checked on every `/v1/exec` request; missing or disallowed subcommands → 403 |
-| **Subcommand injection** | Polecat identity is injected as `--identity <rig>/<name>` and cannot be overridden | Server derives identity from the client certificate, not from the request body |
+| **Identity injection** | Caller identity (`BD_ACTOR`, `GT_ROLE`, `GT_RIG`, `GT_POLECAT`/`GT_CREW`) is set from the client cert CN and cannot be overridden | Server derives `(rig, role, name)` from the cert; subprocess sees no identity vars from the server's environment |
 | **Branch scope** | A polecat can only push to `refs/heads/polecat/<name>-*` | pkt-line stream parsed and validated before `git-receive-pack` is invoked |
 | **Path traversal** | Rig names are validated against `[a-zA-Z0-9_-]+` | Rejects `../` and other traversal attempts |
 | **Body size limits** | `/v1/exec` body capped at 1 MiB; receive-pack ref list capped at 32 MiB | `http.MaxBytesReader` applied before reading |
@@ -412,15 +412,22 @@ security.
 | `POST` | `/v1/admin/issue-cert` | Issue a new polecat client certificate |
 | `POST` | `/v1/admin/deny-cert` | Add a certificate serial to the runtime deny list |
 
-### Issuing a polecat certificate
+### Issuing an agent certificate
 
-Issue a client certificate for a polecat by providing the rig name, polecat
-name, and an optional TTL (defaults to 720h / 30 days):
+Issue a client certificate by providing the rig name, agent name, optional
+role (`polecats` or `crew`, default `polecats`), and optional TTL (default
+720h / 30 days):
 
 ```bash
+# Polecat (default; legacy CN format preserved when role is omitted)
 curl -s -X POST http://127.0.0.1:9877/v1/admin/issue-cert \
   -H 'Content-Type: application/json' \
   -d '{"rig": "MyRig", "name": "rust", "ttl": "720h"}'
+
+# Crew (extended CN format; required for crew identity scoping)
+curl -s -X POST http://127.0.0.1:9877/v1/admin/issue-cert \
+  -H 'Content-Type: application/json' \
+  -d '{"rig": "Indigo", "name": "securityspy", "role": "crew"}'
 ```
 
 Returns HTTP 200 with a JSON body containing the PEM-encoded certificate, key,
@@ -440,8 +447,18 @@ and CA certificate, plus metadata:
 | Field | Type | Description |
 |-------|------|-------------|
 | `rig` | `string` | **Required.** Rig name (e.g. `"MyRig"`) |
-| `name` | `string` | **Required.** Polecat name (e.g. `"rust"`) |
+| `name` | `string` | **Required.** Agent name (e.g. `"rust"`) |
+| `role` | `string` | Optional. `"polecats"` or `"crew"`. Omitting → legacy CN `gt-<rig>-<name>` (treated as polecat). Setting → extended CN `gt-<rig>-<role>-<name>` and address `<rig>/<role>/<name>`. |
 | `ttl` | `string` | Optional Go duration (e.g. `"720h"`). Default: `720h` (30 days) |
+
+**Identity propagation.** When a cert-authenticated request hits `/v1/exec`,
+the proxy parses `(rig, role, name)` from the CN and injects the Gas Town
+identity env vars (`BD_ACTOR`, `GT_ROLE`, `GT_RIG`, plus `GT_POLECAT` or
+`GT_CREW`) into the gt/bd subprocess. This is what makes `gt mail inbox`
+return the caller's mailbox (not the server-side user's) and `gt mail send`
+attribute the message to the correct sender. Certs issued without `role`
+default to polecat scoping; remote crew certs **must** be issued with
+`"role":"crew"` to participate in crew mail routing.
 
 ### Revoking a certificate
 
