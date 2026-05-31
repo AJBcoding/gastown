@@ -540,7 +540,7 @@ func TestHandleGitAuditLog(t *testing.T) {
 
 		e, ok := lc.findEntry(slog.LevelInfo, "git info/refs")
 		require.True(t, ok, "expected INFO 'git info/refs' log record")
-		assert.Equal(t, "gastown/furiosa", e.attrs["identity"])
+		assert.Equal(t, "gastown/polecats/furiosa", e.attrs["identity"])
 		assert.Equal(t, "testrip", e.attrs["rig"])
 		assert.Equal(t, "fetch", e.attrs["op"])
 	})
@@ -567,7 +567,7 @@ func TestHandleGitAuditLog(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		e, ok := lc.findEntry(slog.LevelWarn, "git push denied")
 		require.True(t, ok, "expected WARN 'git push denied' log record")
-		assert.Equal(t, "gastown/furiosa", e.attrs["identity"])
+		assert.Equal(t, "gastown/polecats/furiosa", e.attrs["identity"])
 		assert.Equal(t, "testrip", e.attrs["rig"])
 		assert.Contains(t, e.attrs["refs"], "refs/heads/main")
 	})
@@ -603,7 +603,7 @@ func TestHandleGitAuditLogIntegration(t *testing.T) {
 
 		e, ok := lc.findEntry(slog.LevelInfo, "git fetch")
 		require.True(t, ok, "expected INFO 'git fetch' log record")
-		assert.Equal(t, "gastown/furiosa", e.attrs["identity"])
+		assert.Equal(t, "gastown/polecats/furiosa", e.attrs["identity"])
 		assert.Equal(t, "testrip", e.attrs["rig"])
 	})
 }

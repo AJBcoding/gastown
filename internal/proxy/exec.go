@@ -8,8 +8,33 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"golang.org/x/time/rate"
 )
+
+// roleSegments enumerates the role keywords that may appear as the third
+// segment of an extended cert CN ("gt-<rig>-<role>-<name>"). When a CN's
+// third-from-last hyphen-delimited segment matches one of these values,
+// it is treated as the role and the parts before it are treated as the rig.
+// Any other CN (e.g. legacy "gt-<rig>-<name>") falls back to defaultRoleSegment.
+//
+// The values map onto Gas Town's BD_ACTOR / GT_ROLE convention:
+//
+//	polecats → <rig>/polecats/<name>
+//	crew     → <rig>/crew/<name>
+//
+// Adding a new role here is sufficient to make that role's certs identity-aware;
+// no other changes to the proxy are required.
+var roleSegments = map[string]string{
+	"polecats": constants.RolePolecat,
+	"crew":     constants.RoleCrew,
+}
+
+// defaultRoleSegment is the CN-format segment assumed when a legacy cert
+// ("gt-<rig>-<name>") is presented. Existing certs were issued exclusively
+// for polecats (IssuePolecat is the only issuer), so defaulting to polecats
+// preserves the original behavior for the install base.
+const defaultRoleSegment = "polecats"
 
 // execRequest is the body for POST /v1/exec.
 type execRequest struct {
@@ -32,7 +57,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// Limit request body to prevent a misbehaving client from exhausting memory.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
 
-	// Extract identity from client cert CN (format: gt-<rig>-<name>).
+	// Extract identity from client cert CN; produces "<rig>/<role>/<name>".
 	identity := extractIdentity(r)
 
 	var req execRequest
@@ -165,21 +190,70 @@ func polecatName(cn string) string {
 	return rest[idx+1:]
 }
 
-// cnToIdentity converts a CN of the form "gt-<rig>-<name>" to "<rig>/<name>".
-// The last "-" is treated as the rig/name separator, so hyphenated rig names
-// (e.g. "gas-town") are handled correctly.
+// cnToIdentity converts a CN to its Gas Town address ("<rig>/<role>/<name>").
+// Both CN formats are supported:
+//
+//	gt-<rig>-<role>-<name> → "<rig>/<role>/<name>"   (extended; role embeds explicitly)
+//	gt-<rig>-<name>        → "<rig>/polecats/<name>" (legacy; assumes polecat role)
+//
+// Returns "" if the CN is malformed.
 func cnToIdentity(cn string) string {
-	name := polecatName(cn)
-	if name == "" {
+	rig, role, name := cnToIdentityParts(cn)
+	if rig == "" || name == "" {
 		return ""
 	}
-	// rig is everything between "gt-" and "-<name>".
+	return rig + "/" + role + "/" + name
+}
+
+// cnToIdentityParts splits a cert CN into its (rig, role, name) components.
+//
+// The CN format is one of:
+//
+//	gt-<rig>-<role>-<name>   role ∈ {polecats, crew}; rig may contain "-"
+//	gt-<rig>-<name>          legacy; role defaults to "polecats"
+//
+// Disambiguation: after stripping "gt-" and peeling off <name> (the last
+// hyphen-delimited segment), the remaining prefix's last segment is checked
+// against the role-segment allowlist. Match → that segment is the role; the
+// rig is the prefix before it. No match → the entire prefix is the rig and
+// the role defaults to "polecats".
+//
+// The role return value is the role *segment* used in the BD_ACTOR address
+// ("polecats" or "crew"), NOT the role *constant* (RolePolecat/RoleCrew),
+// because addresses use the segment form.
+//
+// Returns ("", "", "") for malformed CNs (no "gt-" prefix, missing rig, or
+// missing name).
+func cnToIdentityParts(cn string) (rig, role, name string) {
+	if !strings.HasPrefix(cn, "gt-") {
+		return "", "", ""
+	}
 	rest := cn[3:] // strip "gt-"
-	rig := rest[:len(rest)-len(name)-1]
-	if rig == "" {
-		return ""
+	idx := strings.LastIndex(rest, "-")
+	if idx <= 0 {
+		// No separator, or rig segment empty.
+		return "", "", ""
 	}
-	return rig + "/" + name
+	name = rest[idx+1:]
+	if name == "" {
+		return "", "", ""
+	}
+	prefix := rest[:idx] // <rig> or <rig>-<role>
+
+	// Peel an optional trailing role segment off the prefix.
+	role = defaultRoleSegment
+	if roleIdx := strings.LastIndex(prefix, "-"); roleIdx >= 0 {
+		candidate := prefix[roleIdx+1:]
+		if _, ok := roleSegments[candidate]; ok {
+			role = candidate
+			prefix = prefix[:roleIdx]
+		}
+	}
+
+	if prefix == "" {
+		return "", "", ""
+	}
+	return prefix, role, name
 }
 
 // isAllowed reports whether cmd is in the allowlist.
@@ -209,12 +283,11 @@ func runCommand(ctx context.Context, argv []string, identity string) (stdout, st
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 	// Restrict the subprocess environment to prevent server credentials from
-	// leaking into gt/bd calls. Pass identity via env var so commands can
-	// optionally use it without requiring a --identity CLI flag on every command.
-	env := minimalEnv()
-	if identity != "" {
-		env = append(env, "GT_PROXY_IDENTITY="+identity)
-	}
+	// leaking into gt/bd calls. The cert-derived identity is then re-injected
+	// as the Gas Town identity env vars (BD_ACTOR, GT_ROLE, etc.) so gt/bd
+	// scope mail, beads attribution, and role-aware output to the caller —
+	// not to whatever role the server happens to be running as (gh#gt-muo).
+	env := append(minimalEnv(), identityEnv(identity)...)
 	cmd.Env = env
 	err := cmd.Run()
 	if err != nil {
@@ -225,4 +298,80 @@ func runCommand(ctx context.Context, argv []string, identity string) (stdout, st
 		}
 	}
 	return outBuf.String(), errBuf.String(), exitCode
+}
+
+// identityEnv builds the slice of "KEY=value" env entries needed to make gt/bd
+// honor the cert-derived caller identity. The slice is empty when identity is
+// empty (e.g., a non-mTLS request in a unit test).
+//
+// GT_PROXY_IDENTITY is retained as a debug breadcrumb so existing audit
+// tooling that greps for it keeps working; the load-bearing variables are
+// BD_ACTOR, GT_ROLE, GT_RIG, and GT_POLECAT/GT_CREW (see
+// internal/cmd/mail_identity.go detectSenderFromRole).
+func identityEnv(identity string) []string {
+	if identity == "" {
+		return nil
+	}
+	out := []string{"GT_PROXY_IDENTITY=" + identity}
+
+	// identity is "<rig>/<role>/<name>" (post-fix) — split it back into
+	// the components AgentEnv expects. A malformed identity (e.g. a future
+	// caller bypassing cnToIdentity) yields only GT_PROXY_IDENTITY, which is
+	// harmless but won't scope gt/bd.
+	rig, roleSegment, name := splitIdentity(identity)
+	if rig == "" || roleSegment == "" || name == "" {
+		return out
+	}
+	role, ok := roleSegments[roleSegment]
+	if !ok {
+		return out
+	}
+	for k, v := range agentEnvForIdentity(role, rig, name) {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+// splitIdentity is the inverse of cnToIdentity for the post-fix format.
+// Returns ("", "", "") if identity is not "<rig>/<role>/<name>".
+func splitIdentity(identity string) (rig, role, name string) {
+	parts := strings.Split(identity, "/")
+	if len(parts) != 3 {
+		return "", "", ""
+	}
+	return parts[0], parts[1], parts[2]
+}
+
+// agentEnvForIdentity returns the identity-scoping env vars gt/bd consult.
+// This intentionally avoids config.AgentEnv, which also injects session-level
+// settings (Dolt ports, OTEL, NODE_OPTIONS, etc.) that don't apply to a
+// single proxied RPC subprocess and would defeat minimalEnv's isolation goal.
+func agentEnvForIdentity(role, rig, name string) map[string]string {
+	address := fmt.Sprintf("%s/%s/%s", rig, roleSegmentFor(role), name)
+	env := map[string]string{
+		"GT_ROLE":          address,
+		"GT_RIG":           rig,
+		"BD_ACTOR":         address,
+		"GIT_AUTHOR_NAME":  name,
+		"BEADS_AGENT_NAME": fmt.Sprintf("%s/%s", rig, name),
+	}
+	switch role {
+	case constants.RolePolecat:
+		env["GT_POLECAT"] = name
+	case constants.RoleCrew:
+		env["GT_CREW"] = name
+	}
+	return env
+}
+
+// roleSegmentFor returns the address-segment form of a role constant.
+// Inverse of roleSegments. Falls back to the constant itself for unknown
+// roles (defensive; cnToIdentityParts only emits known roles).
+func roleSegmentFor(role string) string {
+	for seg, r := range roleSegments {
+		if r == role {
+			return seg
+		}
+	}
+	return role
 }

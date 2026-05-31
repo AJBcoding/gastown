@@ -142,13 +142,20 @@ func (ca *CA) IssueServer(cn string, extraIPs []net.IP, extraDNSNames []string, 
 	return ca.issue(cn, dnsNames, extraIPs, ttl, x509.ExtKeyUsageServerAuth)
 }
 
-// IssuePolecat issues a leaf certificate signed by the CA for a polecat (client auth).
-// cn must be in the format "gt-<rig>-<name>" with non-empty rig and name segments
-// (e.g. "gt-gastown-furiosa"). Returns an error for malformed CNs to prevent issuing
-// certs whose rig/name parsing would be inconsistent across exec and git auth.
+// IssuePolecat issues a leaf certificate signed by the CA for client auth.
+// cn must be in one of these formats with non-empty rig and name segments:
+//
+//	gt-<rig>-<name>          legacy; identity becomes "<rig>/polecats/<name>"
+//	gt-<rig>-<role>-<name>   role ∈ {polecats, crew}; identity becomes "<rig>/<role>/<name>"
+//
+// Returns an error for malformed CNs to prevent issuing certs whose rig/role/name
+// parsing would be inconsistent across exec and git auth.
+//
+// Despite the name, this issues certs for both polecats and crew now — the
+// "Polecat" suffix is retained for callsite compatibility.
 func (ca *CA) IssuePolecat(cn string, ttl time.Duration) (certPEM, keyPEM []byte, err error) {
 	if cnToIdentity(cn) == "" {
-		return nil, nil, fmt.Errorf("invalid polecat CN %q: must be gt-<rig>-<name> with non-empty rig and name", cn)
+		return nil, nil, fmt.Errorf("invalid agent CN %q: must be gt-<rig>-<name> or gt-<rig>-<role>-<name> with non-empty segments", cn)
 	}
 	return ca.issue(cn, nil, nil, ttl, x509.ExtKeyUsageClientAuth)
 }

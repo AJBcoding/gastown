@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -115,12 +116,14 @@ func TestPolecatName(t *testing.T) {
 		want string
 	}{
 		{"gt-gastown-furiosa", "furiosa"},
-		{"gt-gas-town-furiosa", "furiosa"}, // hyphenated rig
-		{"gt-gastown-", ""},                // empty name
-		{"gt--furiosa", ""},                // empty rig; rejected
-		{"noprefix-rig-name", ""},          // missing gt- prefix
-		{"gt-nodashinrest", ""},            // only one component after stripping gt-
-		{"", ""},                           // empty string
+		{"gt-gas-town-furiosa", "furiosa"},         // hyphenated rig
+		{"gt-gastown-crew-jane", "jane"},           // extended CN: name still the final segment
+		{"gt-gastown-polecats-furiosa", "furiosa"}, // extended CN with polecats role
+		{"gt-gastown-", ""},                        // empty name
+		{"gt--furiosa", ""},                        // empty rig; rejected
+		{"noprefix-rig-name", ""},                  // missing gt- prefix
+		{"gt-nodashinrest", ""},                    // only one component after stripping gt-
+		{"", ""},                                   // empty string
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -136,19 +139,57 @@ func TestCnToIdentity(t *testing.T) {
 		cn   string
 		want string
 	}{
-		{"gt-gastown-furiosa", "gastown/furiosa"},
-		{"gt-gas-town-furiosa", "gas-town/furiosa"}, // hyphenated rig
-		{"gt-gastown-", ""},                         // empty name
-		{"gt--furiosa", ""},                         // empty rig (two consecutive dashes after gt-)
-		{"noprefix-rig-name", ""},                   // missing gt- prefix
-		{"gt-nodashinrest", ""},                     // only one component after stripping gt-
-		{"", ""},                                    // empty string
+		// Legacy "gt-<rig>-<name>" → role defaults to polecats.
+		{"gt-gastown-furiosa", "gastown/polecats/furiosa"},
+		{"gt-gas-town-furiosa", "gas-town/polecats/furiosa"}, // hyphenated rig
+		// Extended "gt-<rig>-<role>-<name>" → role is honored.
+		{"gt-gastown-polecats-furiosa", "gastown/polecats/furiosa"},
+		{"gt-gastown-crew-securityspy", "gastown/crew/securityspy"},
+		{"gt-Indigo-crew-securityspy", "Indigo/crew/securityspy"},     // matches gh#gt-muo repro
+		{"gt-gas-town-crew-securityspy", "gas-town/crew/securityspy"}, // hyphenated rig + role
+		// Malformed.
+		{"gt-gastown-", ""},       // empty name
+		{"gt--furiosa", ""},       // empty rig (two consecutive dashes after gt-)
+		{"gt--crew-furiosa", ""},  // empty rig with role
+		{"noprefix-rig-name", ""}, // missing gt- prefix
+		{"gt-nodashinrest", ""},   // only one component after stripping gt-
+		{"", ""},                  // empty string
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.cn, func(t *testing.T) {
 			got := cnToIdentity(tc.cn)
 			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestCnToIdentityParts(t *testing.T) {
+	cases := []struct {
+		cn                          string
+		wantRig, wantRole, wantName string
+	}{
+		// Legacy CN: role defaults to "polecats".
+		{"gt-gastown-furiosa", "gastown", "polecats", "furiosa"},
+		{"gt-gas-town-furiosa", "gas-town", "polecats", "furiosa"},
+		// Extended CN: role is parsed.
+		{"gt-gastown-polecats-furiosa", "gastown", "polecats", "furiosa"},
+		{"gt-gastown-crew-jane", "gastown", "crew", "jane"},
+		{"gt-gas-town-crew-jane", "gas-town", "crew", "jane"},
+		// Unknown middle segment is treated as rig, not role.
+		{"gt-gastown-foo-bar", "gastown-foo", "polecats", "bar"},
+		// Malformed.
+		{"gt-gastown-", "", "", ""},
+		{"gt--furiosa", "", "", ""},
+		{"", "", "", ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.cn, func(t *testing.T) {
+			gotRig, gotRole, gotName := cnToIdentityParts(tc.cn)
+			assert.Equal(t, tc.wantRig, gotRig, "rig")
+			assert.Equal(t, tc.wantRole, gotRole, "role")
+			assert.Equal(t, tc.wantName, gotName, "name")
 		})
 	}
 }
@@ -168,7 +209,12 @@ func TestExtractIdentity(t *testing.T) {
 
 	t.Run("valid CN parses to identity", func(t *testing.T) {
 		req := makeFakeRequest("POST", "/v1/exec", "", "gt-gastown-rust")
-		assert.Equal(t, "gastown/rust", extractIdentity(req))
+		assert.Equal(t, "gastown/polecats/rust", extractIdentity(req))
+	})
+
+	t.Run("crew CN parses to crew identity", func(t *testing.T) {
+		req := makeFakeRequest("POST", "/v1/exec", "", "gt-gastown-crew-jane")
+		assert.Equal(t, "gastown/crew/jane", extractIdentity(req))
 	})
 }
 
@@ -225,32 +271,92 @@ func TestHandleExec(t *testing.T) {
 		assert.Contains(t, resp.Stdout, "hello")
 	})
 
-	t.Run("GT_PROXY_IDENTITY env var is set when CN is present", func(t *testing.T) {
-		// Write a tiny script that prints the GT_PROXY_IDENTITY env var.
-		// The script is placed in a temp dir added to PATH so AllowedCommands
-		// can reference it by plain name (no path separator — issue 12).
+	t.Run("identity env vars are set when CN is present", func(t *testing.T) {
+		// Write a tiny script that prints each identity-relevant env var on its
+		// own line so the test can assert the full set, not just one breadcrumb.
+		// Regression coverage for gh#gt-muo: before the fix, the proxy only set
+		// GT_PROXY_IDENTITY (which nothing in gt/bd reads), so BD_ACTOR/GT_ROLE
+		// were empty and subprocesses inherited the server's identity (mayor).
 		scriptDir := t.TempDir()
 		commandName := "printenv.sh"
+		printVars := []string{"GT_PROXY_IDENTITY", "BD_ACTOR", "GT_ROLE", "GT_RIG", "GT_POLECAT", "GT_CREW", "GIT_AUTHOR_NAME", "BEADS_AGENT_NAME"}
 		if runtime.GOOS == "windows" {
 			commandName = "printenv"
 			scriptPath := filepath.Join(scriptDir, commandName+".cmd")
-			require.NoError(t, os.WriteFile(scriptPath, []byte("@echo off\r\n<nul set /p =%GT_PROXY_IDENTITY%\r\n"), 0644))
+			var body strings.Builder
+			body.WriteString("@echo off\r\n")
+			for _, v := range printVars {
+				body.WriteString(fmt.Sprintf("echo %s=%%%s%%\r\n", v, v))
+			}
+			require.NoError(t, os.WriteFile(scriptPath, []byte(body.String()), 0644))
 		} else {
 			scriptPath := filepath.Join(scriptDir, commandName)
-			require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nprintf '%s' \"$GT_PROXY_IDENTITY\"\n"), 0755))
+			var body strings.Builder
+			body.WriteString("#!/bin/sh\n")
+			for _, v := range printVars {
+				body.WriteString(fmt.Sprintf("echo \"%s=$%s\"\n", v, v))
+			}
+			require.NoError(t, os.WriteFile(scriptPath, []byte(body.String()), 0755))
 		}
 		t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 		srv2 := newExecTestServer(t, Config{AllowedCommands: []string{commandName}})
-		body := `{"argv":["` + commandName + `"]}`
-		req := makeFakeRequest("POST", "/v1/exec", body, "gt-gastown-rust")
-		rec := httptest.NewRecorder()
-		srv2.handleExec(rec, req)
 
-		require.Equal(t, http.StatusOK, rec.Code)
-		var resp execResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
-		assert.Equal(t, "gastown/rust", resp.Stdout)
+		t.Run("polecat CN (legacy format)", func(t *testing.T) {
+			body := `{"argv":["` + commandName + `"]}`
+			req := makeFakeRequest("POST", "/v1/exec", body, "gt-gastown-rust")
+			rec := httptest.NewRecorder()
+			srv2.handleExec(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			var resp execResponse
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+			assert.Contains(t, resp.Stdout, "GT_PROXY_IDENTITY=gastown/polecats/rust")
+			assert.Contains(t, resp.Stdout, "BD_ACTOR=gastown/polecats/rust")
+			assert.Contains(t, resp.Stdout, "GT_ROLE=gastown/polecats/rust")
+			assert.Contains(t, resp.Stdout, "GT_RIG=gastown")
+			assert.Contains(t, resp.Stdout, "GT_POLECAT=rust")
+			assert.Contains(t, resp.Stdout, "GIT_AUTHOR_NAME=rust")
+			assert.Contains(t, resp.Stdout, "BEADS_AGENT_NAME=gastown/rust")
+			// GT_CREW must not leak when role is polecat.
+			assert.Contains(t, resp.Stdout, "GT_CREW=\n")
+		})
+
+		t.Run("crew CN (extended format)", func(t *testing.T) {
+			body := `{"argv":["` + commandName + `"]}`
+			req := makeFakeRequest("POST", "/v1/exec", body, "gt-Indigo-crew-securityspy")
+			rec := httptest.NewRecorder()
+			srv2.handleExec(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			var resp execResponse
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+			assert.Contains(t, resp.Stdout, "GT_PROXY_IDENTITY=Indigo/crew/securityspy")
+			assert.Contains(t, resp.Stdout, "BD_ACTOR=Indigo/crew/securityspy")
+			assert.Contains(t, resp.Stdout, "GT_ROLE=Indigo/crew/securityspy")
+			assert.Contains(t, resp.Stdout, "GT_RIG=Indigo")
+			assert.Contains(t, resp.Stdout, "GT_CREW=securityspy")
+			assert.Contains(t, resp.Stdout, "GIT_AUTHOR_NAME=securityspy")
+			assert.Contains(t, resp.Stdout, "BEADS_AGENT_NAME=Indigo/securityspy")
+			// GT_POLECAT must not leak when role is crew.
+			assert.Contains(t, resp.Stdout, "GT_POLECAT=\n")
+		})
+
+		t.Run("no CN sets no identity env", func(t *testing.T) {
+			// Plain http.Request with no TLS — extractIdentity returns "".
+			body := `{"argv":["` + commandName + `"]}`
+			req := httptest.NewRequest("POST", "/v1/exec", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			srv2.handleExec(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			var resp execResponse
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+			// All identity vars unset → printed as "VAR=".
+			for _, v := range printVars {
+				assert.Contains(t, resp.Stdout, v+"=\n", "expected %s to be unset", v)
+			}
+		})
 	})
 
 	t.Run("non-zero exit code is returned", func(t *testing.T) {
@@ -439,7 +545,7 @@ func TestHandleExecAuditLog(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code)
 		e, ok := lc.findEntry(slog.LevelInfo, "exec")
 		require.True(t, ok, "expected INFO 'exec' log record")
-		assert.Equal(t, "gastown/shiny", e.attrs["identity"])
+		assert.Equal(t, "gastown/polecats/shiny", e.attrs["identity"])
 		assert.Equal(t, "echo", e.attrs["cmd"])
 	})
 

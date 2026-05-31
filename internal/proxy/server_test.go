@@ -833,4 +833,46 @@ func TestAdminIssueCertEndpoint(t *testing.T) {
 		expectedExpiry := time.Now().Add(720 * time.Hour)
 		assert.WithinDuration(t, expectedExpiry, expiry, 5*time.Minute)
 	})
+
+	t.Run("crew role embeds role in CN", func(t *testing.T) {
+		resp, err := adminClient.Post(
+			"http://"+adminAddr+"/v1/admin/issue-cert",
+			"application/json",
+			strings.NewReader(`{"rig":"Indigo","name":"securityspy","role":"crew","ttl":"1h"}`),
+		)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result issueCertResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		assert.Equal(t, "gt-Indigo-crew-securityspy", result.CN,
+			"crew role should produce extended CN format")
+	})
+
+	t.Run("explicit polecats role also embeds role in CN", func(t *testing.T) {
+		resp, err := adminClient.Post(
+			"http://"+adminAddr+"/v1/admin/issue-cert",
+			"application/json",
+			strings.NewReader(`{"rig":"MyRig","name":"rust","role":"polecats","ttl":"1h"}`),
+		)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result issueCertResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		assert.Equal(t, "gt-MyRig-polecats-rust", result.CN)
+	})
+
+	t.Run("unknown role returns 400", func(t *testing.T) {
+		resp, err := adminClient.Post(
+			"http://"+adminAddr+"/v1/admin/issue-cert",
+			"application/json",
+			strings.NewReader(`{"rig":"MyRig","name":"rust","role":"witness"}`),
+		)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
 }

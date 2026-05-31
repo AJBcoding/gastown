@@ -306,7 +306,10 @@ func TestIssuePolecat(t *testing.T) {
 	t.Run("CN matches and hyphenated rig round-trips", func(t *testing.T) {
 		cases := []string{
 			"gt-gastown-furiosa",
-			"gt-gas-town-furiosa", // hyphenated rig name
+			"gt-gas-town-furiosa",      // hyphenated rig name
+			"gt-gastown-crew-jane",     // extended CN with crew role
+			"gt-gastown-polecats-rust", // extended CN with explicit polecats role
+			"gt-gas-town-crew-jane",    // extended CN + hyphenated rig
 		}
 		for _, cn := range cases {
 			cn := cn
