@@ -239,6 +239,33 @@ func GetRoleWithContext(cwd, townRoot string) (RoleInfo, error) {
 	return info, nil
 }
 
+// isProxiedInvocation reports whether this gt invocation is running inside the
+// proxy server's exec subprocess. The proxy sets GT_PROXY_IDENTITY as a debug
+// breadcrumb (see internal/proxy/exec.go); load-bearing scoping flows through
+// the BD_ACTOR/GT_ROLE/GT_RIG/GT_CREW env vars the proxy derives from the
+// client cert CN. In proxied mode, os.Getwd() returns the proxy server's cwd
+// — not the calling agent's home — so identity must come from env vars.
+func isProxiedInvocation() bool {
+	return os.Getenv("GT_PROXY_IDENTITY") != ""
+}
+
+// resolveCallerIdentity returns the RoleContext for hook/molecule status
+// display. When running under the proxy, env vars are authoritative (cwd is
+// the server's cwd, not the agent's). Otherwise we prefer cwd-based detection
+// so a user cd'd into another worktree sees that worktree's hook rather than
+// a stale GT_ROLE from their shell (gt-5d7eh). GT_ROLE still acts as a
+// fallback when cwd doesn't identify an agent (e.g. at a rig root).
+func resolveCallerIdentity(cwd, townRoot string) (RoleContext, error) {
+	if isProxiedInvocation() {
+		return GetRoleWithContext(cwd, townRoot)
+	}
+	ctx := detectRole(cwd, townRoot)
+	if ctx.Role == RoleUnknown {
+		return GetRoleWithContext(cwd, townRoot)
+	}
+	return ctx, nil
+}
+
 // detectRole detects the agent role from the current working directory path.
 // This is the cwd-based fallback used by GetRoleWithContext when GT_ROLE is not set.
 func detectRole(cwd, townRoot string) RoleInfo {
