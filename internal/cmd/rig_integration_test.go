@@ -1464,3 +1464,49 @@ func checkWorktreeClean(t *testing.T, agent agentWorktree, hasTrackedBeads bool)
 
 	return unexpectedFiles
 }
+
+// TestRigAdopt_CreatesAgentSubdirs is a regression test for gt-fxm.
+//
+// The --adopt path was not creating <rig>/witness/ and <rig>/polecats/. The
+// downstream symptom was `gt rig start` failing the witness with "invalid
+// worktree path: must be at least 2 levels deep from town root" because
+// witnessDir() falls back to the rig root (1 level deep) when <rig>/witness/
+// is missing. AddRig (the clone path) creates these at manager.go:789-803;
+// --adopt must mirror that.
+func TestRigAdopt_CreatesAgentSubdirs(t *testing.T) {
+	requireDoltServer(t)
+
+	tmpDir := t.TempDir()
+	configureTestGitIdentity(t, tmpDir)
+	gtBinary := buildGT(t)
+
+	townRoot := filepath.Join(tmpDir, "town")
+	cmd := exec.Command(gtBinary, "install", townRoot, "--name", "adopt-subdirs-test")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("gt install: %v\n%s", err, out)
+	}
+	bridgeDoltPidToTown(t, townRoot)
+
+	rigDir := filepath.Join(townRoot, "myrig")
+	createTestGitRepoAt(t, rigDir)
+
+	cmd = exec.Command(gtBinary, "rig", "add", "myrig", "--adopt", "--force")
+	cmd.Dir = townRoot
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("gt rig add --adopt: %v\n%s", err, out)
+	}
+
+	for _, sub := range []string{"witness", "polecats"} {
+		path := filepath.Join(rigDir, sub)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("expected %s/ to exist after --adopt (gt-fxm regression): %v", sub, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("expected %s to be a directory, got mode %v", path, info.Mode())
+		}
+	}
+}
