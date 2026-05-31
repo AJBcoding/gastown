@@ -21,7 +21,15 @@ const MinBeadsVersion = "1.0.4"
 // MaxBeadsVersion is the newest beads version this Gas Town release is known
 // to support. Newer bd releases can change the Dolt schema before Gastown has
 // been updated for it, so fail fast instead of surfacing late SQL errors.
-const MaxBeadsVersion = "1.0.4"
+//
+// 2026-05-31 bumped to 1.0.5: bd 1.0.4's bd list --parent queries hardcode
+// the legacy depends_on_id column and fail against the v1.2.0 split-column
+// schema with "column 'depends_on_id' could not be found in any table in
+// scope". bd 1.0.5 has the schema-aware queries. The ceiling-meant-to-protect
+// became the ceiling-that-stranded-us when bd outpaced gt's previous max.
+// Tracked at gt-kyv (operator path) and to-be-filed bead on the ceiling-floor
+// trap pattern.
+const MaxBeadsVersion = "1.0.5"
 
 // BeadsInstallPath is the go install path for the bd version compatible with
 // this Gas Town release.
