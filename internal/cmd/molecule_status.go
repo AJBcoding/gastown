@@ -341,16 +341,11 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		callerCtx := detectRole(cwd, townRoot)
 		validationRole = callerCtx.Role
 	} else {
-		// Use cwd-based detection for status display
-		// This ensures we show the hook for the agent whose directory we're in,
-		// not the agent from the GT_ROLE env var (which might be different if
-		// we cd'd into another rig's crew/polecat directory)
-		roleCtx = detectRole(cwd, townRoot)
-		if roleCtx.Role == RoleUnknown {
-			// Fall back to GT_ROLE when cwd doesn't identify an agent
-			// (e.g., at rig root like ~/gt/beads instead of ~/gt/beads/witness)
-			roleCtx, _ = GetRoleWithContext(cwd, townRoot)
-		}
+		// Resolve caller identity. Under the proxy (GT_PROXY_IDENTITY set), env
+		// vars win because cwd is the server's cwd, not the agent's home. In
+		// local terminal use we prefer cwd so a user cd'd into another worktree
+		// sees that worktree's hook rather than a stale GT_ROLE (gt-5d7eh).
+		roleCtx, _ = resolveCallerIdentity(cwd, townRoot)
 		target = buildAgentIdentity(roleCtx)
 		if target == "" {
 			return fmt.Errorf("cannot determine agent identity (role: %s)", roleCtx.Role)
@@ -972,16 +967,11 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 		// Explicit target provided
 		target = args[0]
 	} else {
-		// Use cwd-based detection for status display
-		// This ensures we show the hook for the agent whose directory we're in,
-		// not the agent from the GT_ROLE env var (which might be different if
-		// we cd'd into another rig's crew/polecat directory)
-		roleCtx = detectRole(cwd, townRoot)
-		if roleCtx.Role == RoleUnknown {
-			// Fall back to GT_ROLE when cwd doesn't identify an agent
-			// (e.g., at rig root like ~/gt/beads instead of ~/gt/beads/witness)
-			roleCtx, _ = GetRoleWithContext(cwd, townRoot)
-		}
+		// Resolve caller identity. Under the proxy (GT_PROXY_IDENTITY set), env
+		// vars win because cwd is the server's cwd, not the agent's home. In
+		// local terminal use we prefer cwd so a user cd'd into another worktree
+		// sees that worktree's hook rather than a stale GT_ROLE (gt-5d7eh).
+		roleCtx, _ = resolveCallerIdentity(cwd, townRoot)
 		target = buildAgentIdentity(roleCtx)
 		if target == "" {
 			return fmt.Errorf("cannot determine agent identity (role: %s)", roleCtx.Role)

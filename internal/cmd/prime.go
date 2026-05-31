@@ -406,6 +406,12 @@ func warnRoleMismatch(roleInfo RoleInfo, cwd string) {
 	if !roleInfo.Mismatch {
 		return
 	}
+	// Under the proxy, cwd is the proxy server's cwd — not the calling agent's
+	// home — so a mismatch is expected and the warning is noise. Identity is
+	// cert-derived and already correct.
+	if isProxiedInvocation() {
+		return
+	}
 	fmt.Printf("\n%s\n", style.Bold.Render("⚠️  ROLE/LOCATION MISMATCH"))
 	fmt.Printf("You are %s (from $GT_ROLE) but your cwd suggests %s.\n",
 		style.Bold.Render(string(roleInfo.Role)),
