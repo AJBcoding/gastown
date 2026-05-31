@@ -1370,6 +1370,18 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks for adopted rig: %v\n", err)
 	}
 
+	// Ensure standard agent subdirectories exist. AddRig (the clone path)
+	// creates these at manager.go:789-803; the adopt path was missing them,
+	// which caused witness startup to fail with "invalid worktree path: must
+	// be at least 2 levels deep" because witnessDir() fell back to the rig
+	// root (1 level deep) when <rig>/witness/ didn't exist. See gt-fxm.
+	for _, sub := range []string{"witness", "polecats"} {
+		subPath := filepath.Join(rigPath, sub)
+		if err := os.MkdirAll(subPath, 0755); err != nil {
+			fmt.Printf("  %s Could not create %s dir: %v\n", style.Warning.Render("!"), sub, err)
+		}
+	}
+
 	// Print results
 	fmt.Printf("\n%s Rig %s adopted\n", style.Success.Render("✓"), name)
 	if result.FromConfig {
