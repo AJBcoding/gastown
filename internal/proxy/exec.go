@@ -125,7 +125,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		execCtx, cancel = context.WithTimeout(execCtx, s.execTimeout)
 		defer cancel()
 	}
-	out, errOut, exitCode := runCommand(execCtx, argv, identity)
+	cwd := resolveBdCwd(s.cfg.TownRoot, argv)
+	out, errOut, exitCode := runCommand(execCtx, argv, identity, cwd)
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
 	if exitCode == 0 {
@@ -277,8 +278,11 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 	return v.(*rate.Limiter)
 }
 
-func runCommand(ctx context.Context, argv []string, identity string) (stdout, stderr string, exitCode int) {
+func runCommand(ctx context.Context, argv []string, identity, cwd string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
