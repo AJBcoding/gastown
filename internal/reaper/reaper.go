@@ -156,10 +156,41 @@ const (
 	// DefaultBatchSize is the number of rows per batch DELETE operation.
 	DefaultBatchSize = 100
 	// DefaultAlertThreshold is the open-wisp count above which callers should
-	// surface a warning. Sized above the natural steady-state for the current
-	// dog/deacon emit rate (~23 wisps/h × 24h TTL ≈ 550). See hq-57jr8.
+	// surface a warning for a project database. Sized above the natural
+	// steady-state for the current dog/deacon emit rate (~23 wisps/h × 24h TTL
+	// ≈ 550). See hq-57jr8. Applied per-database, not to the sum across
+	// databases — see AlertThresholdForDB.
 	DefaultAlertThreshold = 800
+	// HQAlertThreshold is the open-wisp alert threshold for the HQ (town)
+	// database. HQ is the permanent mail ledger: every `gt mail send` is a Dolt
+	// commit, so its wisp count grows monotonically and never returns to a low
+	// steady state. A flat DefaultAlertThreshold guarantees recurring false
+	// escalations (gt-998), so HQ gets a much higher ceiling that still catches
+	// runaway growth without firing on the normal archive baseline.
+	HQAlertThreshold = 5000
 )
+
+// hqDatabaseNames are the database names treated as the permanent HQ ledger,
+// which grows monotonically and warrants a higher alert threshold. Matched
+// case-insensitively. "beads" is the legacy town-beads name.
+var hqDatabaseNames = map[string]bool{
+	"hq":    true,
+	"beads": true,
+}
+
+// AlertThresholdForDB returns the open-wisp alert threshold for a given
+// database. The HQ ledger grows monotonically (it is the permanent mail
+// record), so it gets HQAlertThreshold; every other (project) database gets
+// DefaultAlertThreshold. Comparing each database to its own threshold — rather
+// than comparing the sum of all open wisps to a single flat threshold —
+// prevents HQ's large baseline from triggering false escalations while still
+// catching a genuine lifecycle bug in a project database. See gt-998.
+func AlertThresholdForDB(dbName string) int {
+	if hqDatabaseNames[strings.ToLower(dbName)] {
+		return HQAlertThreshold
+	}
+	return DefaultAlertThreshold
+}
 
 // ValidateDBName returns an error if the database name is unsafe.
 func ValidateDBName(dbName string) error {
@@ -297,6 +328,17 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	openQuery := "SELECT COUNT(*) FROM wisps WHERE status IN ('open', 'hooked', 'in_progress')"
 	if err := db.QueryRowContext(ctx, openQuery).Scan(&result.OpenWisps); err != nil {
 		return nil, fmt.Errorf("count open wisps: %w", err)
+	}
+
+	// Anomaly detection: open wisp count over this database's alert threshold.
+	// Compared per-database (HQ gets a higher ceiling than projects) so the HQ
+	// ledger's monotonic growth does not trip a flat threshold. See gt-998.
+	if threshold := AlertThresholdForDB(dbName); result.OpenWisps > threshold {
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "open_wisps_over_threshold",
+			Message: fmt.Sprintf("%d open wisps exceed alert threshold %d for database %q — investigate wisp lifecycle", result.OpenWisps, threshold, dbName),
+			Count:   result.OpenWisps,
+		})
 	}
 
 	// Anomaly detection: dangling parent references.

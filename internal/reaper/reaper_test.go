@@ -41,6 +41,35 @@ func TestDefaultDatabases(t *testing.T) {
 	}
 }
 
+// TestAlertThresholdForDB verifies that the HQ ledger gets a higher open-wisp
+// alert ceiling than project databases, so its monotonic growth does not trip
+// the flat project threshold (gt-998).
+func TestAlertThresholdForDB(t *testing.T) {
+	tests := []struct {
+		dbName string
+		want   int
+	}{
+		{"hq", HQAlertThreshold},
+		{"HQ", HQAlertThreshold},    // case-insensitive
+		{"beads", HQAlertThreshold}, // legacy town-beads name
+		{"gastown", DefaultAlertThreshold},
+		{"longeye", DefaultAlertThreshold},
+		{"some_project", DefaultAlertThreshold},
+		{"", DefaultAlertThreshold},
+	}
+	for _, tt := range tests {
+		if got := AlertThresholdForDB(tt.dbName); got != tt.want {
+			t.Errorf("AlertThresholdForDB(%q) = %d, want %d", tt.dbName, got, tt.want)
+		}
+	}
+	// The HQ ceiling must be strictly higher than the project ceiling, otherwise
+	// the per-database distinction is meaningless.
+	if HQAlertThreshold <= DefaultAlertThreshold {
+		t.Errorf("HQAlertThreshold (%d) should exceed DefaultAlertThreshold (%d)",
+			HQAlertThreshold, DefaultAlertThreshold)
+	}
+}
+
 func TestFormatJSON(t *testing.T) {
 	result := FormatJSON(map[string]int{"count": 42})
 	if result == "" {

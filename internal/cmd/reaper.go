@@ -250,6 +250,13 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 					r.Database, prefix, r.Reaped, r.OpenRemain)
 				totalReaped += r.Reaped
 				totalOpen += r.OpenRemain
+				// Per-database alert: HQ grows monotonically and gets a higher
+				// threshold than projects, so compare each database to its own
+				// ceiling rather than the sum to a flat threshold (gt-998).
+				if threshold := reaper.AlertThresholdForDB(r.Database); r.OpenRemain > threshold {
+					fmt.Fprintf(os.Stderr, "WARNING: %s: %d open wisps exceed alert threshold (%d)\n",
+						r.Database, r.OpenRemain, threshold)
+				}
 			}
 			if len(results) > 1 {
 				prefix := ""
@@ -258,10 +265,6 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 				}
 				fmt.Printf("\n%sReap summary (%d databases): reaped %d wisps, %d open remain\n",
 					prefix, len(results), totalReaped, totalOpen)
-				if totalOpen > reaper.DefaultAlertThreshold {
-					fmt.Fprintf(os.Stderr, "WARNING: %d open wisps exceed alert threshold (%d)\n",
-						totalOpen, reaper.DefaultAlertThreshold)
-				}
 			}
 		}
 		return nil

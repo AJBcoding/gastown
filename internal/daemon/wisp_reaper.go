@@ -160,6 +160,10 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	port := d.doltServerPort()
 	dryRun := config.DryRun
 	var totalReaped, totalOpen, totalPurged, totalMailPurged, totalAutoClosed int
+	// Databases whose open-wisp count exceeds their own alert threshold. Tracked
+	// per-database because HQ grows monotonically and gets a higher ceiling than
+	// projects, so a flat threshold on the sum produces false alerts (gt-998).
+	var overThreshold []string
 
 	// Step 2: Reap
 	reapErrors := 0
@@ -187,6 +191,9 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 		totalReaped += result.Reaped
 		totalOpen += result.OpenRemain
+		if threshold := reaper.AlertThresholdForDB(dbName); result.OpenRemain > threshold {
+			overThreshold = append(overThreshold, fmt.Sprintf("%s=%d/%d", dbName, result.OpenRemain, threshold))
+		}
 		if result.Reaped > 0 {
 			d.logger.Printf("wisp_reaper: %s: reaped %d stale wisps, %d open remain", dbName, result.Reaped, result.OpenRemain)
 		}
@@ -318,9 +325,9 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	}
 
 	// Step 5: Report
-	if totalOpen > wispAlertThreshold {
-		d.logger.Printf("wisp_reaper: WARNING: %d open wisps exceed threshold %d — investigate wisp lifecycle",
-			totalOpen, wispAlertThreshold)
+	if len(overThreshold) > 0 {
+		d.logger.Printf("wisp_reaper: WARNING: open wisps exceed alert threshold (%s) — investigate wisp lifecycle",
+			strings.Join(overThreshold, ", "))
 	}
 	d.logger.Printf("wisp_reaper: cycle complete — reaped=%d purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
 		totalReaped, totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)

@@ -22,7 +22,7 @@ This is infrastructure cleanup work:
 | purge_age | config | Max closed wisp age before purging (default 7d) |
 | stale_issue_age | config | Max issue staleness before auto-close (default 30d) |
 | mail_delete_age | config | Max closed mail age before purging (default 7d) |
-| alert_threshold | config | Open wisp count that triggers escalation (default 500) |
+| alert_threshold | config | Per-database open wisp count that triggers escalation for project DBs (default 800; HQ uses a higher built-in ceiling) |
 | dry_run | config | If "true", report without acting |
 | databases | config | Comma-separated DB list (default: auto-discover) |
 | dolt_port | config | Dolt server port (default 3307) |
@@ -39,7 +39,9 @@ issues that are not P0/P1, not epics, and have no active dependencies.
 The Dog should watch for and flag:
 - Dangling parent references (wisps referencing purged parents)
 - Sudden spikes in reap candidates (suggests a wisp lifecycle problem)
-- Open wisp counts exceeding alert_threshold
+- Open wisp counts exceeding a database's per-database alert threshold
+  (surfaced as an `open_wisps_over_threshold` anomaly; HQ has a higher ceiling
+  than projects because it is the permanent, monotonically-growing mail ledger)
 - Dolt commit failures (data may not be persisted)
 
 NOT anomalies (do NOT escalate these):
@@ -47,7 +49,7 @@ NOT anomalies (do NOT escalate these):
   race condition — the witness closes wisps for dead sessions concurrently.
   This is expected behavior, not a bug."""
 formula = "mol-dog-reaper"
-version = 2
+version = 3
 
 [squash]
 trigger = "on_complete"
@@ -79,7 +81,12 @@ gt reaper scan --db=<name> --port={{dolt_port}} \\
 - Check the `anomalies` array in the JSON output
 - Flag any `dangling_parent_ref` anomalies — these indicate wisps with
   parent dependency records pointing to purged/missing parents
-- If `open_wisps` exceeds {{alert_threshold}}, escalate
+- Flag any `open_wisps_over_threshold` anomalies — these mean a database's
+  open wisp count exceeds ITS OWN per-database alert threshold. Each database
+  is compared to its own ceiling (HQ, the permanent mail ledger, gets a much
+  higher threshold than project databases because it grows monotonically).
+  Do NOT compare the raw `open_wisps` count to a single flat number yourself —
+  trust the anomaly, which already accounts for the per-database threshold.
 
 **4. Decide whether to proceed:**
 - If no candidates found across all databases, skip remaining steps
@@ -108,8 +115,10 @@ gt reaper reap --db=<name> --port={{dolt_port}} \\
 - Check for any anomalies in the response
 
 **3. Alert check:**
-If total open wisps across all databases exceed {{alert_threshold}},
-log a warning and consider escalating.
+The `reap` output warns per-database when a database's open wisp count exceeds
+its own alert threshold (HQ gets a higher ceiling than projects, since the HQ
+ledger grows monotonically). Escalate only the specific databases that the
+output flags — do NOT escalate based on the sum across databases.
 
 **Exit criteria:** All stale wisps closed (or dry-run counts reported)."""
 
@@ -205,7 +214,7 @@ description = "Max closed mail age before purging (e.g., '168h' = 7 days)"
 default = "168h"
 
 [vars.alert_threshold]
-description = "Open wisp count that triggers escalation warning"
+description = "Per-database open wisp count that triggers an escalation warning for project databases. HQ (the permanent mail ledger) uses a higher built-in ceiling since it grows monotonically."
 default = "800"
 
 [vars.dry_run]
