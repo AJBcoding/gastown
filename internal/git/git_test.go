@@ -14,6 +14,14 @@ func initTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 
+	// Resolve symlinks so the path matches what git reports via
+	// `rev-parse --show-toplevel`. On macOS the temp dir may live under
+	// /tmp (a symlink to /private/tmp), and git always reports the resolved
+	// real path. Without this, equality checks against the repo root fail.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+
 	// Initialize repo
 	cmd := exec.Command("git", "init")
 	cmd.Dir = dir
