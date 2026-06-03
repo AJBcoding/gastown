@@ -11,11 +11,11 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 // Common errors
@@ -401,6 +401,52 @@ func (m *Manager) ClearWork(name string) error {
 	return m.saveState(name, state)
 }
 
+// WorktreesStale reports whether a dog's recorded worktrees are unusable and
+// must be refreshed before the dog can do work. A worktree is considered stale
+// when its recorded path either (a) lies outside the current town root — e.g.
+// the dog was created under an older town layout — or (b) no longer exists on
+// disk. A dog with no recorded worktrees at all is also stale.
+//
+// Dispatching to a dog with stale worktrees is the root cause of the recurring
+// "session-dead while state=working" zombie (gt-y9l): the session starts
+// (its WorkDir is the kennel dir, which exists) but the agent dies silently
+// the moment it tries to operate in a worktree path that is missing.
+//
+// Returns (stale, reason, err). reason is a human-readable explanation when
+// stale is true.
+func (m *Manager) WorktreesStale(name string) (bool, string, error) {
+	if err := validateDogName(name); err != nil {
+		return false, "", err
+	}
+	if !m.exists(name) {
+		return false, "", ErrDogNotFound
+	}
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return false, "", fmt.Errorf("loading state: %w", err)
+	}
+
+	if len(state.Worktrees) == 0 {
+		return true, "no recorded worktrees", nil
+	}
+
+	// Normalize the town root once for prefix comparison.
+	root := filepath.Clean(m.townRoot)
+	for rigName, wtPath := range state.Worktrees {
+		clean := filepath.Clean(wtPath)
+		rel, relErr := filepath.Rel(root, clean)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true, fmt.Sprintf("worktree for rig %s (%s) is outside town root %s", rigName, wtPath, root), nil
+		}
+		if info, statErr := os.Stat(clean); statErr != nil || !info.IsDir() {
+			return true, fmt.Sprintf("worktree for rig %s (%s) is missing on disk", rigName, wtPath), nil
+		}
+	}
+
+	return false, "", nil
+}
+
 // Refresh recreates all worktrees for a dog with fresh branches.
 // This is useful when worktrees have drifted or become stale.
 // Each rig is refreshed atomically with a state save, so a failure at rig N
@@ -447,12 +493,23 @@ func (m *Manager) Refresh(name string) error {
 			return fmt.Errorf("finding repo base for %s: %w", rigName, err)
 		}
 
-		// Remove old worktree if it exists
+		// Remove old worktree if it exists (the recorded path may be stale or
+		// point outside the current town root).
 		if oldWorktreePath != "" {
 			_ = repoGit.WorktreeRemove(oldWorktreePath, true)
 			_ = os.RemoveAll(oldWorktreePath)
-			_ = repoGit.WorktreePrune()
 		}
+
+		// Also clear the canonical target path. A dog created under an older
+		// town layout (or a prior failed run) may have left a physical
+		// directory at dogPath/rigName that the recorded path didn't reference;
+		// `git worktree add` fails if that directory already exists. See gt-y9l.
+		canonicalPath := filepath.Join(dogPath, rigName)
+		if canonicalPath != oldWorktreePath {
+			_ = repoGit.WorktreeRemove(canonicalPath, true)
+			_ = os.RemoveAll(canonicalPath)
+		}
+		_ = repoGit.WorktreePrune()
 
 		// Fetch latest from origin
 		_ = repoGit.Fetch("origin")

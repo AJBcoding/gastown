@@ -1138,6 +1138,30 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Heal stale worktrees before assigning work. A dog whose recorded
+	// worktrees point outside the current town root or no longer exist on disk
+	// (e.g. created under an older town layout) starts a session but dies
+	// silently when its agent operates in the missing worktree — the recurring
+	// "session-dead while state=working" zombie. Refresh recreates worktrees
+	// from the current rigs config. See gt-y9l.
+	//
+	// Skip for freshly created dogs: their worktrees were just built.
+	if !dogCreated {
+		if stale, reason, _ := mgr.WorktreesStale(targetDog.Name); stale {
+			if !dogDispatchJSON {
+				fmt.Printf("  Healing stale worktrees for dog %s (%s)\n", targetDog.Name, reason)
+			}
+			if refErr := mgr.Refresh(targetDog.Name); refErr != nil {
+				return fmt.Errorf("dog %s has stale worktrees (%s) and refresh failed: %w", targetDog.Name, reason, refErr)
+			}
+			result.WorktreesHealed = true
+			// Re-fetch so downstream uses the refreshed worktree paths.
+			if refreshed, getErr := mgr.Get(targetDog.Name); getErr == nil {
+				targetDog = refreshed
+			}
+		}
+	}
+
 	// Assign work FIRST (before sending mail) to prevent race condition
 	// If this fails, we haven't sent any mail yet
 	if err := mgr.AssignWork(targetDog.Name, workDesc); err != nil {
@@ -1249,16 +1273,17 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 
 // dogDispatchResult is the JSON output for gt dog dispatch.
 type dogDispatchResult struct {
-	Plugin         string   `json:"plugin"`
-	PluginRig      string   `json:"plugin_rig,omitempty"`
-	PluginPath     string   `json:"plugin_path"`
-	Dog            string   `json:"dog"`
-	DogCreated     bool     `json:"dog_created,omitempty"`
-	Work           string   `json:"work"`
-	DryRun         bool     `json:"dry_run,omitempty"`
-	SessionStarted bool     `json:"session_started"`
-	WorkConfirmed  bool     `json:"work_confirmed"`
-	Warnings       []string `json:"warnings,omitempty"`
+	Plugin          string   `json:"plugin"`
+	PluginRig       string   `json:"plugin_rig,omitempty"`
+	PluginPath      string   `json:"plugin_path"`
+	Dog             string   `json:"dog"`
+	DogCreated      bool     `json:"dog_created,omitempty"`
+	Work            string   `json:"work"`
+	DryRun          bool     `json:"dry_run,omitempty"`
+	SessionStarted  bool     `json:"session_started"`
+	WorkConfirmed   bool     `json:"work_confirmed"`
+	WorktreesHealed bool     `json:"worktrees_healed,omitempty"`
+	Warnings        []string `json:"warnings,omitempty"`
 }
 
 // dogEscalateBestEffort fires a MEDIUM escalation via gt escalate.
@@ -1274,4 +1299,3 @@ func ifStr(cond bool, ifTrue, ifFalse string) string {
 	}
 	return ifFalse
 }
-

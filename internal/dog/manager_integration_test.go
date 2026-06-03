@@ -445,6 +445,67 @@ func TestManager_Refresh_Integration_RecreatesWorktrees(t *testing.T) {
 	}
 }
 
+// TestManager_Refresh_Integration_HealsStaleExternalWorktree reproduces the
+// recurring-zombie root cause (gt-y9l): a dog whose recorded worktree points
+// outside the current town root (e.g. created under an older town layout) while
+// a physical, git-registered directory still occupies the canonical path. The
+// old Refresh only removed the recorded (external) path, so `git worktree add`
+// then failed on the still-occupied canonical path. Refresh must now clear the
+// canonical path too and heal cleanly.
+func TestManager_Refresh_Integration_HealsStaleExternalWorktree(t *testing.T) {
+	m, _ := testTownWithGitRigs(t)
+
+	dog, err := m.Add("alpha")
+	if err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+
+	canonicalPath := dog.Worktrees["testrig"]
+	if _, err := os.Stat(canonicalPath); err != nil {
+		t.Fatalf("expected canonical worktree to exist: %v", err)
+	}
+
+	// Corrupt state the way alpha was corrupted: record a stale, external path
+	// (a town root that no longer exists) while the real git worktree still sits
+	// at the canonical path, unreferenced by state.
+	staleExternal := filepath.Join(t.TempDir(), "old-town", "deacon", "dogs", "alpha", "testrig")
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name:      "alpha",
+		State:     StateIdle,
+		Worktrees: map[string]string{"testrig": staleExternal},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+
+	// Sanity: this state is detected as stale.
+	if stale, _, _ := m.WorktreesStale("alpha"); !stale {
+		t.Fatal("expected corrupted alpha state to be reported stale")
+	}
+
+	// Heal. This must succeed despite the canonical path still being occupied.
+	if err := m.Refresh("alpha"); err != nil {
+		t.Fatalf("Refresh() should heal stale worktree, got error: %v", err)
+	}
+
+	healed, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get() after Refresh error = %v", err)
+	}
+	newPath := healed.Worktrees["testrig"]
+	if newPath != canonicalPath {
+		t.Errorf("expected healed worktree at canonical path %q, got %q", canonicalPath, newPath)
+	}
+	cmd := exec.Command("git", "-C", newPath, "status")
+	if err := cmd.Run(); err != nil {
+		t.Errorf("healed worktree is not a valid git repo: %v", err)
+	}
+
+	// After healing, the dog must no longer be stale.
+	if stale, reason, _ := m.WorktreesStale("alpha"); stale {
+		t.Errorf("expected alpha healthy after Refresh, still stale: %s", reason)
+	}
+}
+
 // =============================================================================
 // RefreshRig Integration Tests
 // =============================================================================
