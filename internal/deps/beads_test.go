@@ -67,7 +67,7 @@ func TestCheckBeadsVersionString(t *testing.T) {
 		},
 		{
 			name:    "above maximum is too new",
-			version: "1.0.5",
+			version: "1.0.6",
 			want:    BeadsTooNew,
 		},
 		{
