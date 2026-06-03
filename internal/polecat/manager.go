@@ -116,6 +116,7 @@ var (
 	ErrPolecatExists      = errors.New("polecat already exists")
 	ErrPolecatNotFound    = errors.New("polecat not found")
 	ErrHasChanges         = errors.New("polecat has uncommitted changes")
+	ErrSessionActive      = errors.New("polecat session is still active")
 	ErrHasUncommittedWork = errors.New("polecat has uncommitted work")
 	ErrShellInWorktree    = errors.New("shell working directory is inside polecat worktree")
 	ErrDoltUnhealthy      = errors.New("dolt health check failed")
@@ -1137,6 +1138,30 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 
 	if !m.exists(name) {
 		return ErrPolecatNotFound
+	}
+
+	// Active-session guard (gt-jb6): refuse to remove a polecat whose tmux session
+	// is still alive and healthy. Force-removing an active session deletes the
+	// worktree AND resets the agent bead from under a working polecat — exactly the
+	// blast radius reported in the incident. This guard is NOT bypassable by force;
+	// the caller must stop the session first (gt polecat stop). It runs before any
+	// mutation so a blocked removal leaves the agent bead and worktree untouched.
+	//
+	// Exemptions:
+	//   - selfNuke: the polecat is deleting its own worktree, so its own session is
+	//     alive by design (gt done).
+	//   - nuclear: `gt polecat nuke` is the explicit, work-losing escape hatch. The
+	//     witness auto-nuke path (NukePolecat) kills the tmux session before calling
+	//     it, so this exemption does not reopen the incident path.
+	//   - nil tmux: the caller has no session handle (e.g. town-wide shutdown
+	//     listing, unit tests) and cannot verify liveness; responsibility for
+	//     stopping sessions falls to that caller.
+	if !selfNuke && !nuclear && m.tmux != nil {
+		sm := NewSessionManager(m.tmux, m.rig)
+		if running, _ := sm.IsRunning(name); running {
+			return fmt.Errorf("%w: %s/%s\n\nStop the session first, then retry:\n  gt polecat stop %s/%s",
+				ErrSessionActive, m.rig.Name, name, m.rig.Name, name)
+		}
 	}
 
 	// Clone path is where the git worktree lives (new or old structure)

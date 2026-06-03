@@ -100,9 +100,12 @@ var polecatRemoveCmd = &cobra.Command{
 	Short: "Remove polecats from a rig",
 	Long: `Remove one or more polecats from a rig.
 
-Fails if session is running (stop first).
+Always fails if the session is running — stop it first with 'gt polecat stop'.
+This is NOT bypassable by --force: force-removing an active session destroys the
+worktree and agent bead from under a working polecat.
+
 Warns if uncommitted changes exist.
-Use --force to bypass checks.
+Use --force to bypass the uncommitted-changes check (does not touch live sessions).
 
 Examples:
   gt polecat remove greenplace/Toast
@@ -330,7 +333,7 @@ func init() {
 	polecatListCmd.Flags().BoolVar(&polecatListAll, "all", false, "List polecats in all rigs")
 
 	// Remove flags
-	polecatRemoveCmd.Flags().BoolVarP(&polecatForce, "force", "f", false, "Force removal, bypassing checks")
+	polecatRemoveCmd.Flags().BoolVarP(&polecatForce, "force", "f", false, "Bypass the uncommitted-changes check (does NOT remove a live session — stop it first)")
 	polecatRemoveCmd.Flags().BoolVar(&polecatRemoveAll, "all", false, "Remove all polecats in the rig")
 
 	// Status flags
@@ -663,14 +666,17 @@ func runPolecatRemove(cmd *cobra.Command, args []string) error {
 	removed := 0
 
 	for _, p := range targets {
-		// Check if session is running
-		if !polecatForce {
-			polecatMgr := polecat.NewSessionManager(t, p.r)
-			running, _ := polecatMgr.IsRunning(p.polecatName)
-			if running {
-				removeErrors = append(removeErrors, fmt.Sprintf("%s/%s: session is running (stop first or use --force)", p.rigName, p.polecatName))
-				continue
-			}
+		// Check if session is running. This check is UNCONDITIONAL — even --force
+		// must not remove a polecat with a live, healthy session. Force-removing an
+		// active session destroys the worktree and resets the agent bead from under
+		// a working polecat (gt-jb6). To remove an active polecat, stop its session
+		// first; --force only bypasses the uncommitted-changes check, not this one.
+		polecatMgr := polecat.NewSessionManager(t, p.r)
+		if running, _ := polecatMgr.IsRunning(p.polecatName); running {
+			removeErrors = append(removeErrors, fmt.Sprintf(
+				"%s/%s: session is still running — stop it first: gt polecat stop %s/%s",
+				p.rigName, p.polecatName, p.rigName, p.polecatName))
+			continue
 		}
 
 		fmt.Printf("Removing polecat %s/%s...\n", p.rigName, p.polecatName)
