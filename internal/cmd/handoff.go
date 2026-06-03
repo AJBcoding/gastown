@@ -78,6 +78,7 @@ var (
 	handoffReason     string
 	handoffNoGitCheck bool
 	handoffYes        bool
+	handoffNoMail     bool
 )
 
 func init() {
@@ -92,6 +93,7 @@ func init() {
 	handoffCmd.Flags().StringVar(&handoffReason, "reason", "", "Reason for handoff (e.g., 'compaction', 'idle')")
 	handoffCmd.Flags().BoolVar(&handoffNoGitCheck, "no-git-check", false, "Skip git workspace cleanliness check")
 	handoffCmd.Flags().BoolVarP(&handoffYes, "yes", "y", false, "Skip confirmation prompt (for automation and scripting)")
+	handoffCmd.Flags().BoolVar(&handoffNoMail, "no-mail", false, "Respawn without creating a handoff mail bead (relies on existing hooked work; falls back to mail if the hook is empty)")
 	rootCmd.AddCommand(handoffCmd)
 }
 
@@ -291,22 +293,35 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 	// Placed after the dry-run guard to avoid mutating session state during dry-run.
 	updateSessionEnvForHandoff(t, currentSession, "")
 
-	// Send handoff mail to self (defaults applied inside sendHandoffMail).
-	// The mail is auto-hooked so the next session picks it up.
-	// CRITICAL: Mail must persist to Dolt BEFORE logging to town.log.
-	// If Dolt is down, we must NOT log a false handoff to town.log.
-	beadID, err := sendHandoffMail(handoffSubject, handoffMessage)
-	if err != nil {
-		// Handoff persistence failure is fatal — do not silently continue.
-		// A silent failure causes the next session to find an empty hook,
-		// losing all handoff context.
-		if townRoot, trErr := workspace.FindFromCwd(); trErr == nil && townRoot != "" {
-			_ = LogHandoffNoPersist(townRoot, agent, handoffSubject, err)
+	// --no-mail: respawn without creating a permanent handoff mail bead.
+	// Used by per-cycle patrol handoffs (e.g. the Deacon) where the successor's
+	// work is already on the hook (gt patrol report hooks the next patrol wisp)
+	// and a self-mail with no consumer would accumulate as permanent Dolt commits
+	// every cycle (gt-a74). Safety net: if the hook is unexpectedly empty, fall
+	// back to sending the mail so the successor is never stranded (gt-12).
+	if handoffNoMail && agentHasHookedWork() {
+		fmt.Printf("%s Skipping handoff mail (--no-mail; hook already has work)\n", style.Dim.Render("📭"))
+	} else {
+		if handoffNoMail {
+			fmt.Printf("%s --no-mail requested but no hooked work found; sending handoff mail to avoid stranding successor\n", style.Dim.Render("⚠️"))
 		}
-		fmt.Fprintf(os.Stderr, "The session was NOT respawned. Fix the issue and retry 'gt handoff'.\n")
-		return fmt.Errorf("handoff mail failed to persist (Dolt may be down): %w", err)
+		// Send handoff mail to self (defaults applied inside sendHandoffMail).
+		// The mail is auto-hooked so the next session picks it up.
+		// CRITICAL: Mail must persist to Dolt BEFORE logging to town.log.
+		// If Dolt is down, we must NOT log a false handoff to town.log.
+		beadID, err := sendHandoffMail(handoffSubject, handoffMessage)
+		if err != nil {
+			// Handoff persistence failure is fatal — do not silently continue.
+			// A silent failure causes the next session to find an empty hook,
+			// losing all handoff context.
+			if townRoot, trErr := workspace.FindFromCwd(); trErr == nil && townRoot != "" {
+				_ = LogHandoffNoPersist(townRoot, agent, handoffSubject, err)
+			}
+			fmt.Fprintf(os.Stderr, "The session was NOT respawned. Fix the issue and retry 'gt handoff'.\n")
+			return fmt.Errorf("handoff mail failed to persist (Dolt may be down): %w", err)
+		}
+		fmt.Printf("%s Sent handoff mail %s (auto-hooked)\n", style.Bold.Render("📬"), beadID)
 	}
-	fmt.Printf("%s Sent handoff mail %s (auto-hooked)\n", style.Bold.Render("📬"), beadID)
 
 	// Log handoff event AFTER Dolt persistence succeeds.
 	// Previously this logged BEFORE sendHandoffMail, causing false entries
@@ -1249,6 +1264,40 @@ func getSessionPane(sessionName string) (string, error) {
 		return "", fmt.Errorf("no panes found in session")
 	}
 	return lines[0], nil
+}
+
+// agentHasHookedWork reports whether the current agent already has at least one
+// bead on its hook (status=hooked). Used by `gt handoff --no-mail` to decide
+// whether a handoff mail is needed: if the successor already has work hooked
+// (e.g. a patrol wisp created by `gt patrol report`), the mail is redundant and
+// would only accumulate as a permanent Dolt commit each cycle (gt-a74).
+//
+// On any error (identity/town-root resolution, listing) it returns false so the
+// caller falls back to sending the handoff mail — never strand the successor.
+func agentHasHookedWork() bool {
+	agentID, _, _, err := resolveSelfTarget()
+	if err != nil {
+		return false
+	}
+	// Normalize to the beads assignee format used by both the patrol wisp hook
+	// and sendHandoffMail (e.g. "deacon/" -> "deacon").
+	agentID = mail.AddressToIdentity(agentID)
+
+	townRoot := detectTownRootFromCwd()
+	if townRoot == "" {
+		return false
+	}
+
+	townB := beads.New(filepath.Join(townRoot, ".beads"))
+	hooked, err := townB.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: agentID,
+		Priority: -1,
+	})
+	if err != nil {
+		return false
+	}
+	return len(hooked) > 0
 }
 
 // sendHandoffMail sends a handoff mail to self and auto-hooks it.

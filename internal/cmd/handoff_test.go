@@ -46,6 +46,18 @@ func TestHandoffStdinFlag(t *testing.T) {
 	})
 }
 
+func TestHandoffNoMailFlag(t *testing.T) {
+	// The --no-mail flag lets per-cycle patrol handoffs (e.g. the Deacon) respawn
+	// without creating a permanent handoff-mail bead every cycle (gt-a74).
+	flag := handoffCmd.Flags().Lookup("no-mail")
+	if flag == nil {
+		t.Fatal("handoff command must register a --no-mail flag")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--no-mail default = %q, want \"false\" (mail is the safe default)", flag.DefValue)
+	}
+}
+
 func TestSessionWorkDir(t *testing.T) {
 	setupHandoffTestRegistry(t)
 	townRoot := "/home/test/gt"

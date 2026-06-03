@@ -291,8 +291,16 @@ func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
 			if !strings.Contains(step.Description, "gt deacon heartbeat") {
 				t.Error("loop-or-exit step must refresh heartbeat before await-signal")
 			}
-			if strings.Contains(step.Description, "gt handoff -s") && strings.Contains(step.Description, "mandatory") {
+			if strings.Contains(step.Description, "gt handoff") && strings.Contains(step.Description, "mandatory") {
 				foundMandatoryHandoff = true
+			}
+			// The per-cycle handoff MUST use --no-mail so it respawns without
+			// creating a permanent handoff-mail bead every cycle (gt-a74). The
+			// successor's work is already on the hook (gt patrol report hooks the
+			// next patrol wisp), so the mail would be a redundant self-message
+			// that floods HQ with permanent Dolt commits.
+			if !strings.Contains(step.Description, "gt handoff --no-mail") {
+				t.Error("loop-or-exit per-cycle handoff must use \"gt handoff --no-mail\" to avoid flooding HQ with permanent handoff-mail beads (gt-a74)")
 			}
 			heartbeatPos := strings.Index(step.Description, "gt deacon heartbeat \"pre-await checkpoint\"")
 			awaitPos := strings.Index(step.Description, "gt mol step await-signal")
