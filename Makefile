@@ -25,8 +25,22 @@ LDFLAGS := -s -w \
 # Homebrew installs icu4c as a keg-only package, so headers/libs aren't on the
 # default search path. Auto-detect the prefix and export CGo flags.
 ifeq ($(shell uname),Darwin)
+  # Primary: ask Homebrew (works when `brew` is on PATH).
   ICU_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
-  ifneq ($(ICU_PREFIX),)
+  # Fallback: `brew` is often NOT on PATH for processes started by launchd
+  # (e.g. the refinery service), which left ICU_PREFIX empty and broke the
+  # build with "fatal error: 'unicode/regex.h' file not found" (gt-5ln).
+  # Probe well-known Homebrew opt locations for the actual header, preferring
+  # versioned kegs (icu4c@NN), then strip back to the install prefix.
+  ifeq ($(strip $(ICU_PREFIX)),)
+    ICU_HEADER := $(firstword $(wildcard \
+      /opt/homebrew/opt/icu4c@*/include/unicode/regex.h \
+      /opt/homebrew/opt/icu4c/include/unicode/regex.h \
+      /usr/local/opt/icu4c@*/include/unicode/regex.h \
+      /usr/local/opt/icu4c/include/unicode/regex.h))
+    ICU_PREFIX := $(patsubst %/include/unicode/regex.h,%,$(ICU_HEADER))
+  endif
+  ifneq ($(strip $(ICU_PREFIX)),)
     export CGO_CPPFLAGS += -I$(ICU_PREFIX)/include
     export CGO_LDFLAGS  += -L$(ICU_PREFIX)/lib
   endif
