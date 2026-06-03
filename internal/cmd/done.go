@@ -76,6 +76,35 @@ const (
 	ExitDeferred  = "DEFERRED"
 )
 
+// verifyBranchBeadCorrespondence guards against completing the wrong bead when a
+// polecat is on a stale branch from a previous assignment (gt-3vu).
+//
+// Polecat branches encode their issue: polecat/<worker>/<issue>@<timestamp>.
+// When the issue we're about to complete differs from the one encoded in the
+// branch, the worktree's git state belongs to a *different* assignment — its
+// commits reference and deliver the branch's issue, not issueID. Completing here
+// would mark issueID CLOSED with no corresponding deliverable (or graft another
+// bead's commits onto it). Abort so the caller surfaces an error instead of
+// silently closing.
+//
+// Returns nil (no mismatch) when the branch does not encode an issue (modern
+// polecat/<worker>-<timestamp> format) or when issueID is empty — there is
+// nothing to compare against in those cases.
+func verifyBranchBeadCorrespondence(branch, issueID string) error {
+	if issueID == "" {
+		return nil
+	}
+	branchIssue := parseBranchName(branch).Issue
+	if branchIssue == "" || branchIssue == issueID {
+		return nil
+	}
+	return fmt.Errorf("branch/bead mismatch: on branch %q (issue %s) but completing %s\n"+
+		"This usually means the worktree is on a stale branch from a previous assignment.\n"+
+		"The work for %s — if any — is not on this branch, so completing would close it with no deliverable.\n"+
+		"Fix: check out the correct branch for %s, or use --status DEFERRED to exit without completing",
+		branch, branchIssue, issueID, issueID, issueID)
+}
+
 func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	targetBranch := defaultBranch
 	if explicitTarget != "" {
@@ -486,6 +515,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if exitType == ExitCompleted {
 		if branch == defaultBranch || branch == "master" {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
+		}
+
+		// Branch/bead correspondence guard (gt-3vu).
+		// The branch name may encode an issue (polecat/<worker>/<issue>@<ts>).
+		// If that encoded issue differs from the issue we're about to complete,
+		// the polecat is on a STALE branch from a previous assignment: completing
+		// here would mark the wrong bead, or mark a bead whose work lives on a
+		// different branch — the "premature CLOSE with zero deliverable" class.
+		// Abort loudly rather than silently closing. Polecat-only, matching the
+		// zero-commit guard below.
+		if os.Getenv("GT_POLECAT") != "" {
+			if corrErr := verifyBranchBeadCorrespondence(branch, issueID); corrErr != nil {
+				return corrErr
+			}
 		}
 
 		// CRITICAL: Verify work exists before completing (hq-xthqf)
