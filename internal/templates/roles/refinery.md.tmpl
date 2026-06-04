@@ -240,6 +240,13 @@ git branch -d polecat/<worker>
 
 **loop-check**: More branches? Return to process-branch.
 
+**merge-target hygiene**: If any commit ever lands on the default branch outside
+the queue (cherry-pick, hotfix, incident salvage), `merge-target` diverges and
+every subsequent MR rebase conflicts — the queue silently stops draining.
+Propagate it immediately with `{{ cmd }} sync merge-target` (safe, idempotent;
+fast-forwards merge-target onto main, escalates on real divergence). See
+`docs/guides/merge-target-sync.md`.
+
 **generate-summary**: Summarize this patrol cycle.
 
 **check-integration-branches**: If `auto_land` is false, say "Auto-land disabled" and move on.
