@@ -27,7 +27,7 @@ func resetBeadsVersionCheckForTest(t *testing.T, fn func() (deps.BeadsStatus, st
 
 func TestCheckBeadsVersionRejectsVersionsAboveSupportedMaximum(t *testing.T) {
 	resetBeadsVersionCheckForTest(t, func() (deps.BeadsStatus, string) {
-		return deps.BeadsTooNew, "1.0.5"
+		return deps.BeadsTooNew, "1.0.6"
 	})
 
 	err := CheckBeadsVersion()
@@ -37,7 +37,7 @@ func TestCheckBeadsVersionRejectsVersionsAboveSupportedMaximum(t *testing.T) {
 	if !isUnsupportedNewBeadsVersion(err) {
 		t.Fatalf("expected unsupported-new marker for error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "supports at most 1.0.4") {
+	if !strings.Contains(err.Error(), "supports at most 1.0.5") {
 		t.Fatalf("error %q does not mention supported maximum", err)
 	}
 	if !strings.Contains(err.Error(), deps.BeadsInstallPath) {
@@ -61,7 +61,7 @@ func TestCheckBeadsVersionDoesNotHardFailOlderVersionErrors(t *testing.T) {
 
 func TestPersistentPreRunFailsForBdAboveSupportedMaximum(t *testing.T) {
 	resetBeadsVersionCheckForTest(t, func() (deps.BeadsStatus, string) {
-		return deps.BeadsTooNew, "1.0.5"
+		return deps.BeadsTooNew, "1.0.6"
 	})
 
 	for _, use := range []string{"ready"} {
@@ -83,7 +83,7 @@ func TestPersistentPreRunAllowsBeadsExemptCommandsWithBdAboveSupportedMaximum(t 
 			called := false
 			resetBeadsVersionCheckForTest(t, func() (deps.BeadsStatus, string) {
 				called = true
-				return deps.BeadsTooNew, "1.0.5"
+				return deps.BeadsTooNew, "1.0.6"
 			})
 
 			if err := persistentPreRun(&cobra.Command{Use: use}, nil); err != nil {
@@ -100,7 +100,7 @@ func TestPersistentPreRunAllowsRoleCommandsWithBdAboveSupportedMaximum(t *testin
 	called := false
 	resetBeadsVersionCheckForTest(t, func() (deps.BeadsStatus, string) {
 		called = true
-		return deps.BeadsTooNew, "1.0.5"
+		return deps.BeadsTooNew, "1.0.6"
 	})
 
 	roleCmd := &cobra.Command{Use: "role"}
@@ -119,7 +119,7 @@ func TestPersistentPreRunSkipsBdVersionCheckForHotPathCommands(t *testing.T) {
 	called := false
 	resetBeadsVersionCheckForTest(t, func() (deps.BeadsStatus, string) {
 		called = true
-		return deps.BeadsTooNew, "1.0.5"
+		return deps.BeadsTooNew, "1.0.6"
 	})
 
 	if err := persistentPreRun(&cobra.Command{Use: "status-line"}, nil); err != nil {
