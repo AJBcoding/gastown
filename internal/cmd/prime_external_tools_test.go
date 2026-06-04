@@ -19,7 +19,12 @@ func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string 
 
 	oldTimeout := primeExternalToolTimeout
 	oldWaitDelay := primeExternalToolWaitDelay
-	primeExternalToolTimeout = 100 * time.Millisecond
+	// Default to a generous timeout so the bd/gt stub reliably spawns and records
+	// its call regardless of macOS subprocess-spawn latency. The original 100ms
+	// raced with spawn and flaked ~60% on macOS. Tests that specifically exercise
+	// the timeout (the "Bounds" tests below) tighten primeExternalToolTimeout
+	// after this setup; their stubs sleep far longer than that tightened value.
+	primeExternalToolTimeout = 2 * time.Second
 	primeExternalToolWaitDelay = 10 * time.Millisecond
 	t.Cleanup(func() {
 		primeExternalToolTimeout = oldTimeout
@@ -108,7 +113,7 @@ esac
 `, `
 case "$*" in
   "mail check --inject")
-    (: > "$PRIME_CHILD_STARTED"; sleep 0.5; : > "$PRIME_CHILD_SURVIVED") &
+    (: > "$PRIME_CHILD_STARTED"; sleep 1.5; : > "$PRIME_CHILD_SURVIVED") &
     while [ ! -f "$PRIME_CHILD_STARTED" ]; do sleep 0.01; done
     wait
     exit 0
@@ -117,10 +122,15 @@ esac
 `)
 	t.Setenv("PRIME_CHILD_STARTED", startedPath)
 	t.Setenv("PRIME_CHILD_SURVIVED", survivedPath)
+	// Tighten the timeout so the slow mail child (sleeps 1.5s) is bounded. 700ms
+	// sits well above macOS subprocess spawn latency — so both the fast memory
+	// stub and the mail stub reliably record their calls before any kill — and
+	// well below the child's 1.5s survival write, so the kill lands cleanly.
+	primeExternalToolTimeout = 700 * time.Millisecond
 
 	start := time.Now()
 	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), 1300*time.Millisecond)
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
@@ -131,7 +141,9 @@ esac
 		t.Fatalf("child did not start before timeout: %v", err)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	// Wait past the child's 1.5s survival write (relative to start) so a child
+	// that wrongly survived the kill would be observed below.
+	time.Sleep(time.Until(start.Add(1900 * time.Millisecond)))
 	if _, err := os.Stat(survivedPath); err == nil {
 		t.Fatalf("child process survived command timeout and wrote %s", survivedPath)
 	} else if !os.IsNotExist(err) {
@@ -175,6 +187,10 @@ case "$*" in
 esac
 `, `
 `)
+	// Tighten the timeout so the slow bd list (sleeps 2s) is bounded. 700ms is
+	// well above spawn latency (the stub logs its call first) and well below the
+	// stub's 2s sleep, so the call is recorded yet the wait stays well under 2s.
+	primeExternalToolTimeout = 700 * time.Millisecond
 
 	start := time.Now()
 	output := captureStdout(t, func() {

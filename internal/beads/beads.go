@@ -568,6 +568,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	beadsDir := b.getResolvedBeadsDir()
 	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
+	runEnv = withConsistentPWD(runEnv, b.workDir)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 	if shouldThrottleBDRead(fullArgs) {
 		unlock, err := b.acquireBDReadThrottle(bdReadThrottleTimeout)
@@ -701,6 +702,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
 	runEnv := b.buildRoutingEnv()
+	runEnv = withConsistentPWD(runEnv, b.workDir)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
 	// Bound subprocess runtime — see bdSubprocessTimeout doc comment.
@@ -936,6 +938,25 @@ func doltConnectionFromBeadsDir(beadsDir string) (port string, host string, data
 
 // stripEnvPrefixes removes entries matching any of the given prefixes from an
 // environment variable slice. Used by runWithRouting to strip BEADS_DIR.
+// withConsistentPWD ensures the subprocess environment's PWD matches workDir,
+// the directory we chdir the bd subprocess into via cmd.Dir. Without this, the
+// inherited PWD names the parent's cwd; a shell (or any tool that trusts $PWD)
+// then either uses the stale value or resets PWD to getcwd(), which on macOS
+// resolves symlinks (e.g. /var/folders -> /private/var/folders). That makes
+// $PWD diverge from the unresolved paths we pass in env (BEADS_DIR, etc.).
+// Stripping any inherited PWD and appending the canonical one keeps subprocess
+// path comparisons consistent with the values we hand it.
+func withConsistentPWD(env []string, workDir string) []string {
+	if workDir == "" {
+		return env
+	}
+	abs, err := filepath.Abs(workDir)
+	if err != nil {
+		abs = workDir
+	}
+	return append(stripEnvKey(env, "PWD"), "PWD="+abs)
+}
+
 func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 	filtered := make([]string, 0, len(environ))
 	for _, env := range environ {

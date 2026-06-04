@@ -8,6 +8,23 @@ import (
 	"testing"
 )
 
+// tempTownRoot returns a temp directory with symlinks resolved, suitable for
+// use as a fake town root. On macOS t.TempDir() lives under /var/folders, which
+// is a symlink to /private/var/folders. Code under test derives the town root
+// from os.Getwd() (which resolves symlinks after os.Chdir, since Chdir does not
+// update $PWD), so fixtures that set BEADS_DIR / routing env vars from the raw
+// temp path would mismatch the resolved path bd subprocesses actually see —
+// causing "wrong database" / "bead not found" failures only on macOS. Resolving
+// the temp dir up front keeps both sides in the same (/private) form.
+func tempTownRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(t.TempDir()): %v", err)
+	}
+	return dir
+}
+
 // buildGT builds the gt binary and returns its path.
 // It caches the build across tests in the same run.
 var cachedGTBinary string

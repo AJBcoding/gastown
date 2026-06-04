@@ -824,7 +824,7 @@ func TestConvoyInfo_IsOwnedDirect(t *testing.T) {
 func setupTownWithBdStub(t *testing.T, bdScript string) (townRoot, logPath string) {
 	t.Helper()
 
-	townRoot = t.TempDir()
+	townRoot = tempTownRoot(t)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}
