@@ -125,7 +125,7 @@ func TestShortMQSHA(t *testing.T) {
 	}{
 		{"", ""},
 		{"abc123", "abc123"},
-		{"0123456789ab", "0123456789ab"},        // exactly 12, unchanged
+		{"0123456789ab", "0123456789ab"},         // exactly 12, unchanged
 		{"0123456789abcdef", "0123456789ab"},     // truncated to 12
 		{"  0123456789abcdef  ", "0123456789ab"}, // trimmed then truncated
 	}
