@@ -54,7 +54,11 @@ func (p *Proxy) terminateProcess() {
 		}
 
 		time.AfterFunc(2*time.Second, func() {
-			if p.cmd.ProcessState == nil || !p.cmd.ProcessState.Exited() {
+			// Probe liveness with signal 0 instead of reading p.cmd.ProcessState.
+			// ProcessState is written by cmd.Wait() (Proxy.Forward), so reading it
+			// here from the timer goroutine is a data race. isProcessAlive() only
+			// reads p.cmd.Process (set once at Start, never mutated by Wait).
+			if p.isProcessAlive() {
 				if pgid == 0 {
 					pgid, _ = syscall.Getpgid(p.cmd.Process.Pid)
 				}
