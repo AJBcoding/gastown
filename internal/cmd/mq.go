@@ -166,7 +166,11 @@ Examples:
 }
 
 // Post-merge flags
-var mqPostMergeSkipBranchDelete bool
+var (
+	mqPostMergeSkipBranchDelete bool
+	mqPostMergeCommit           string
+	mqPostMergeSkipVerify       bool
+)
 
 var mqPostMergeCmd = &cobra.Command{
 	Use:   "post-merge <rig> <mr-id>",
@@ -174,16 +178,26 @@ var mqPostMergeCmd = &cobra.Command{
 	Long: `Perform post-merge cleanup after a successful merge.
 
 This command consolidates post-merge steps into a single atomic operation:
+  0. Verify the merge commit actually landed on origin/<target> (phantom-done guard)
   1. Close the MR bead (status: merged)
   2. Close the source issue
   3. Delete the remote polecat branch (unless --skip-branch-delete)
 
+Step 0 guards against the "phantom-done" failure: 'git push' exits 0 (or the
+refinery agent self-reports a successful push) but the commit never reached
+origin, so the MR is closed and the convoy marked complete while origin/<target>
+never advanced. With --commit set, this command refuses to close the MR unless
+'git ls-remote origin <target>' confirms the SHA landed (gt-hs8).
+
 Designed for use by the refinery formula after a successful merge to main.
-The branch name is read from the MR bead, so no manual branch argument is needed.
+The branch name and target are read from the MR bead, so no manual branch
+argument is needed. Pass --commit "$(git rev-parse HEAD)" captured immediately
+after the local merge so closure is gated on verified-on-remote state.
 
 Examples:
-  gt mq post-merge gastown gt-mr-abc123
-  gt mq post-merge gastown gt-mr-abc123 --skip-branch-delete`,
+  gt mq post-merge gastown gt-mr-abc123 --commit 4e88906f
+  gt mq post-merge gastown gt-mr-abc123 --skip-branch-delete
+  gt mq post-merge gastown gt-mr-abc123 --skip-verify   # bypass (discouraged)`,
 	Args: cobra.ExactArgs(2),
 	RunE: runMQPostMerge,
 }
@@ -334,6 +348,8 @@ func init() {
 
 	// Post-merge flags
 	mqPostMergeCmd.Flags().BoolVar(&mqPostMergeSkipBranchDelete, "skip-branch-delete", false, "Skip remote branch deletion")
+	mqPostMergeCmd.Flags().StringVar(&mqPostMergeCommit, "commit", "", "Merge commit SHA to verify on origin/<target> before closing the MR (phantom-done guard)")
+	mqPostMergeCmd.Flags().BoolVar(&mqPostMergeSkipVerify, "skip-verify", false, "Skip the verified-push check before closing (discouraged)")
 
 	// Add subcommands
 	mqCmd.AddCommand(mqSubmitCmd)
@@ -501,12 +517,108 @@ func runMQReject(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// mergeVerifyAction is the decision produced by planMergeVerification.
+type mergeVerifyAction int
+
+const (
+	// mergeVerifySkip: do not verify (explicit --skip-verify).
+	mergeVerifySkip mergeVerifyAction = iota
+	// mergeVerifyCheck: verify expectedSHA landed on origin/target.
+	mergeVerifyCheck
+	// mergeVerifyRefuseNoSHA: no SHA to verify against — refuse to close.
+	mergeVerifyRefuseNoSHA
+)
+
+// planMergeVerification decides how to gate MR closure on a verified push.
+// Pure (no git/beads access) so the phantom-done decision logic is unit-testable.
+// commitFlag is --commit; mrTarget/mrMergeCommit come from the MR bead;
+// defaultBranch is the rig fallback when the MR has no explicit target.
+func planMergeVerification(skipVerify bool, commitFlag, mrTarget, mrMergeCommit, defaultBranch string) (target, expectedSHA string, action mergeVerifyAction) {
+	target = strings.TrimSpace(mrTarget)
+	if target == "" {
+		target = strings.TrimSpace(defaultBranch)
+	}
+	if skipVerify {
+		return target, "", mergeVerifySkip
+	}
+	expectedSHA = strings.TrimSpace(commitFlag)
+	if expectedSHA == "" {
+		expectedSHA = strings.TrimSpace(mrMergeCommit)
+	}
+	if expectedSHA == "" {
+		return target, "", mergeVerifyRefuseNoSHA
+	}
+	return target, expectedSHA, mergeVerifyCheck
+}
+
+// verifyMergeLanded confirms the merge commit actually reached origin/<target>
+// before the MR is closed. This is the decisive phantom-done guard (gt-hs8):
+// a post-push 'git ls-remote origin <target>' must resolve to the expected SHA,
+// otherwise we refuse to close the MR and leave it OPEN for retry.
+//
+// The expected SHA is taken from --commit (preferred: captured by the formula
+// immediately after the local merge) or falls back to the MR bead's merge_commit
+// field. When neither is available, closure is refused unless --skip-verify is set,
+// so a missing SHA can never silently degrade into an unverified close.
+func verifyMergeLanded(r *rig.Rig, mrID string, mgr *refinery.Manager) error {
+	mrTarget, mrMergeCommit := "", ""
+	if mr, mrErr := mgr.GetMR(mrID); mrErr == nil && mr != nil {
+		mrTarget = mr.TargetBranch
+		mrMergeCommit = mr.MergeCommit
+	}
+
+	target, expectedSHA, action := planMergeVerification(
+		mqPostMergeSkipVerify, mqPostMergeCommit, mrTarget, mrMergeCommit, r.DefaultBranch())
+
+	switch action {
+	case mergeVerifySkip:
+		style.PrintWarning("post-merge: --skip-verify set — closing %s WITHOUT confirming origin advanced", mrID)
+		return nil
+	case mergeVerifyRefuseNoSHA:
+		return fmt.Errorf("post-merge refused: no merge commit to verify for %s — "+
+			"pass --commit \"$(git rev-parse HEAD)\" (captured after the local merge) or --skip-verify; "+
+			"refusing to close the MR without confirming origin/%s landed", mrID, target)
+	}
+
+	rigGit, gitErr := getRigGit(r.Path)
+	if gitErr != nil {
+		return fmt.Errorf("post-merge verify: %w", gitErr)
+	}
+	if verifyErr := rigGit.VerifyPushedCommit("origin", target, expectedSHA); verifyErr != nil {
+		return fmt.Errorf("post-merge refused: %w — MR %s left OPEN; origin/%s did not advance to %s "+
+			"(phantom-done averted, gt-hs8). Retry the push or escalate to the witness",
+			verifyErr, mrID, target, shortMQSHA(expectedSHA))
+	}
+
+	fmt.Printf("%s Verified merge landed: origin/%s = %s\n", style.Success.Render("✓"), target, shortMQSHA(expectedSHA))
+	return nil
+}
+
+// shortMQSHA truncates a commit SHA for display.
+func shortMQSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 func runMQPostMerge(_ *cobra.Command, args []string) error {
 	rigName := args[0]
 	mrID := args[1]
 
 	mgr, r, _, err := getRefineryManager(rigName)
 	if err != nil {
+		return err
+	}
+
+	// Phantom-done guard (gt-hs8): verify the merge commit actually landed on
+	// origin/<target> BEFORE closing the MR / source issue. The refinery agent
+	// merges and pushes with raw git, then trusts its own self-report that the
+	// push succeeded. When 'git push' exits 0 but the commit never reached origin
+	// (network flake, stale auth, partial write), closing the MR here causes
+	// silent merge loss: MR closed + convoy complete while origin never advanced.
+	if err := verifyMergeLanded(r, mrID, mgr); err != nil {
 		return err
 	}
 

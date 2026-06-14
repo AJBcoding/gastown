@@ -244,15 +244,25 @@ GATE: Cannot proceed to merge without fix OR bead filed
 ```
 **FORBIDDEN**: Note failure and merge without tracking.
 
-**merge-push**: Merge to effective target and push immediately
+**merge-push**: Merge to effective target, push, then **verify it landed** before closing
 ```bash
 ## Resolve <merge-target> per Target Resolution Rule above.
 git checkout <merge-target>
 git merge --ff-only temp
+MERGE_SHA=$(git rev-parse HEAD)            # the SHA that MUST appear on origin
 git push origin <merge-target>
+
+# Phantom-done guard (gt-hs8): `git push` can exit 0 while the commit never
+# reached origin. NEVER close the MR on the push's self-report — close it through
+# post-merge with --commit, which re-checks `git ls-remote origin <merge-target>`
+# and REFUSES to close (leaving the MR OPEN) if origin did not advance.
+gt mq post-merge {{ .RigName }} <mr-id> --commit "$MERGE_SHA"
+
 git branch -d temp
 git branch -d polecat/<worker>
 ```
+If `post-merge` prints "post-merge refused", the push did NOT land: leave the MR
+open, do not send completion signals, debug/retry the push, or escalate to the witness.
 
 **loop-check**: More branches? Return to process-branch.
 

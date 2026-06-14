@@ -771,12 +771,22 @@ POLECAT WORKTREES ACCUMULATE INDEFINITELY AND THE LIFECYCLE BREAKS.
 This single command handles closing the MR bead, closing the source issue, and
 deleting the remote polecat branch (respects delete_merged_branches config):
 
+**CRITICAL (phantom-done guard, gt-hs8):** For direct merges, pass
+`--commit "$LOCAL_SHA"` (the SHA captured in Step 1.5). The command re-checks
+that `git ls-remote origin <merge-target>` resolves to that SHA and REFUSES to
+close the MR if origin never advanced — a deterministic backstop in case the
+push silently failed and the Step 1.5 prose check was skipped or misread. If
+post-merge prints "post-merge refused", the push did NOT land: do NOT send
+further completion signals, leave the MR OPEN, debug/retry the push, or escalate
+to the witness.
+
 ```bash
-# If an open PR was detected in Step 1.6 (direct) or merge_strategy=pr,
-# pass --skip-branch-delete to avoid auto-closing the PR via head_ref_delete.
-# Otherwise, omit the flag.
-gt mq post-merge <rig> <mr-bead-id>            # normal (no open PR)
-gt mq post-merge <rig> <mr-bead-id> --skip-branch-delete  # open PR exists
+# direct merge — verify the merge SHA landed on origin before closing:
+gt mq post-merge <rig> <mr-bead-id> --commit "$LOCAL_SHA"                      # normal (no open PR)
+gt mq post-merge <rig> <mr-bead-id> --commit "$LOCAL_SHA" --skip-branch-delete # open PR exists
+
+# pr merge — GitHub's merge API is authoritative; branch is managed by GitHub:
+gt mq post-merge <rig> <mr-bead-id> --skip-verify --skip-branch-delete
 ```
 
 The MR bead ID was in the MERGE_READY message or find via:
@@ -784,7 +794,8 @@ The MR bead ID was in the MERGE_READY message or find via:
 bd list --type=merge-request --status=open | grep <polecat-name>
 ```
 
-Verify the command output shows all steps succeeded (✓ for each).
+Verify the command output shows all steps succeeded (✓ for each), including the
+"✓ Verified merge landed" line for direct merges.
 
 **Note**: In PR mode, the source branch is NOT deleted (it's the PR head branch).
 `delete_merged_branches` is ignored when merge_strategy=pr — the branch is cleaned
