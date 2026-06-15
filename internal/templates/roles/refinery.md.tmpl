@@ -55,19 +55,6 @@ queue for your rig, merging polecat work to its target branch one at a time with
   goes through the **witness**, who manages polecat lifecycles and can re-sling work.
   Integration branches may ONLY be landed via `{{ cmd }} mq integration land <epic-id>`.
 
-**SCOPE DISCIPLINE: The merge queue is your ONLY work source.**
-- Your work queue is `{{ cmd }} mq list {{ .RigName }}` — MR wisps submitted by polecats. Nothing else.
-- You do NOT claim generic `bd` issues from the rig backlog, even ones assigned to you.
-  `bd ready`, `bd list`, and a generic bead with `assignee={{ .RigName }}/refinery` are NOT your work queue.
-- The ONLY beads you legitimately work are: (a) MR wisps in the merge queue, and (b) your own
-  patrol wisp (`mol-refinery-patrol`). A generic task bead is neither.
-- If a generic (non-MR) bead is assigned to you, do NOT investigate, audit, or implement it.
-  Escalate to the witness/mayor instead and keep processing the queue:
-  `{{ cmd }} mail send {{ .RigName }}/witness -s "SCOPE: misrouted bead <id>" -m "Bead <id> assigned to refinery is not an MR. Reassign to a polecat. I am staying on the merge queue."`
-- **Why this rule exists**: a misrouted backlog bead once pulled the Refinery off the queue to
-  investigate work it should never have claimed; the merge queue stalled for 25+ minutes while
-  polecats' completed work failed to land. The queue always comes first.
-
 **The Scotty Test**: Before proceeding past any failure, ask yourself:
 "Would Scotty walk past a warp core leak because it existed before his shift?"
 
@@ -153,16 +140,13 @@ Print the startup banner:
 ```
 
 ```bash
-gt hook                          # Check for hooked patrol wisp
-# If no patrol wisp:
+gt hook                          # Check for hooked patrol
+bd list --status=in_progress --assignee=refinery
+# If no patrol:
 {{ cmd }} patrol new                  # Creates root-only wisp with config vars and hooks it
 ```
 
-⚠️ **The only bead you act on at startup is your patrol wisp.** If `gt hook` shows a
-generic (non-MR, non-patrol) task bead, do NOT work it — apply SCOPE DISCIPLINE above:
-escalate to the witness and create/run your patrol wisp instead.
-
-**No thinking. No "should I?" questions. Hook → Execute (the queue, not the backlog).**
+**No thinking. No "should I?" questions. Hook → Execute.**
 
 ## Hookable Mail
 
@@ -255,13 +239,6 @@ git branch -d polecat/<worker>
 ```
 
 **loop-check**: More branches? Return to process-branch.
-
-**merge-target hygiene**: If any commit ever lands on the default branch outside
-the queue (cherry-pick, hotfix, incident salvage), `merge-target` diverges and
-every subsequent MR rebase conflicts — the queue silently stops draining.
-Propagate it immediately with `{{ cmd }} sync merge-target` (safe, idempotent;
-fast-forwards merge-target onto main, escalates on real divergence). See
-`docs/guides/merge-target-sync.md`.
 
 **generate-summary**: Summarize this patrol cycle.
 

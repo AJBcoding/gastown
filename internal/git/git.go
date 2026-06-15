@@ -978,19 +978,6 @@ func (g *Git) Push(remote, branch string, force bool) error {
 	return err
 }
 
-// PushRefspec pushes an explicit refspec (e.g. "origin/main:refs/heads/merge-target")
-// to the remote. Unlike Push, this updates a remote branch without checking it out
-// locally, so it never mutates the working tree (and avoids the town-root mutation
-// guard). A non-force push only succeeds when the update is a fast-forward.
-func (g *Git) PushRefspec(remote, refspec string, force bool) error {
-	args := []string{"push", remote, refspec}
-	if force {
-		args = append(args, "--force-with-lease")
-	}
-	_, err := g.runWithTimeout(pushTimeout, args...)
-	return err
-}
-
 // PushWithEnv pushes with additional environment variables.
 // Used by gt mq integration land to set GT_INTEGRATION_LAND=1, which the
 // pre-push hook checks to allow integration branch content landing on main.

@@ -188,45 +188,6 @@ func TestRenderRole_Refinery_DefaultBranch(t *testing.T) {
 	}
 }
 
-// TestRenderRole_Refinery_ScopeDiscipline verifies the refinery role makes the
-// merge queue its only work source and explicitly forbids claiming generic bd
-// backlog issues. Regression guard for gt-a15: the Refinery once claimed a
-// generic assigned bead and stalled the merge queue for 25+ minutes.
-func TestRenderRole_Refinery_ScopeDiscipline(t *testing.T) {
-	tmpl, err := New()
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	data := RoleData{
-		Role:          "refinery",
-		RigName:       "myrig",
-		TownRoot:      "/test/town",
-		TownName:      "town",
-		WorkDir:       "/test/town/myrig/refinery/rig",
-		DefaultBranch: "main",
-		MayorSession:  "gt-town-mayor",
-		DeaconSession: "gt-town-deacon",
-	}
-
-	output, err := tmpl.RenderRole("refinery", data)
-	if err != nil {
-		t.Fatalf("RenderRole() error = %v", err)
-	}
-
-	if !strings.Contains(output, "SCOPE DISCIPLINE: The merge queue is your ONLY work source.") {
-		t.Error("output missing SCOPE DISCIPLINE heading - refinery must be scoped to the merge queue")
-	}
-	if !strings.Contains(output, "do NOT claim generic `bd` issues") {
-		t.Error("output missing prohibition on claiming generic bd backlog issues")
-	}
-	// The old startup line actively told refinery to list assigned beads, which
-	// surfaced generic backlog beads. It must no longer be present.
-	if strings.Contains(output, "bd list --status=in_progress --assignee=refinery") {
-		t.Error("output still contains the startup 'bd list --assignee=refinery' line that surfaced generic backlog beads")
-	}
-}
-
 func TestRenderMessage_Spawn(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {
