@@ -279,7 +279,7 @@ func TestHandleExec(t *testing.T) {
 		// were empty and subprocesses inherited the server's identity (mayor).
 		scriptDir := t.TempDir()
 		commandName := "printenv.sh"
-		printVars := []string{"GT_PROXY_IDENTITY", "BD_ACTOR", "GT_ROLE", "GT_RIG", "GT_POLECAT", "GT_CREW", "GIT_AUTHOR_NAME", "BEADS_AGENT_NAME"}
+		printVars := []string{"GT_PROXY_IDENTITY", "BD_ACTOR", "GT_ROLE", "GT_RIG", "GT_POLECAT", "GT_CREW", "GIT_AUTHOR_NAME", "BEADS_AGENT_NAME", "GT_TOWN_ROOT"}
 		if runtime.GOOS == "windows" {
 			commandName = "printenv"
 			scriptPath := filepath.Join(scriptDir, commandName+".cmd")
@@ -320,6 +320,8 @@ func TestHandleExec(t *testing.T) {
 			assert.Contains(t, resp.Stdout, "BEADS_AGENT_NAME=gastown/rust")
 			// GT_CREW must not leak when role is polecat.
 			assert.Contains(t, resp.Stdout, "GT_CREW=\n")
+			// GT_TOWN_ROOT anchors the workspace gate for forwarded gt/bd (gt-kpi).
+			assert.Contains(t, resp.Stdout, "GT_TOWN_ROOT="+srv2.cfg.TownRoot+"\n")
 		})
 
 		t.Run("crew CN (extended format)", func(t *testing.T) {
@@ -340,6 +342,8 @@ func TestHandleExec(t *testing.T) {
 			assert.Contains(t, resp.Stdout, "BEADS_AGENT_NAME=Indigo/securityspy")
 			// GT_POLECAT must not leak when role is crew.
 			assert.Contains(t, resp.Stdout, "GT_POLECAT=\n")
+			// GT_TOWN_ROOT anchors the workspace gate for forwarded gt/bd (gt-kpi).
+			assert.Contains(t, resp.Stdout, "GT_TOWN_ROOT="+srv2.cfg.TownRoot+"\n")
 		})
 
 		t.Run("no CN sets no identity env", func(t *testing.T) {
@@ -402,26 +406,26 @@ func TestHandleExec(t *testing.T) {
 
 func TestRunCommand(t *testing.T) {
 	t.Run("echo world produces expected stdout", func(t *testing.T) {
-		stdout, stderr, code := runCommand(context.Background(), []string{"echo", "world"}, "", "")
+		stdout, stderr, code := runCommand(context.Background(), []string{"echo", "world"}, "", "", "")
 		assert.Equal(t, "world\n", stdout)
 		assert.Equal(t, "", stderr)
 		assert.Equal(t, 0, code)
 	})
 
 	t.Run("sh exit 42 returns exitCode 42", func(t *testing.T) {
-		_, _, code := runCommand(context.Background(), []string{"sh", "-c", "exit 42"}, "", "")
+		_, _, code := runCommand(context.Background(), []string{"sh", "-c", "exit 42"}, "", "", "")
 		assert.Equal(t, 42, code)
 	})
 
 	t.Run("stderr is captured separately", func(t *testing.T) {
-		stdout, stderr, code := runCommand(context.Background(), []string{"sh", "-c", "echo err >&2"}, "", "")
+		stdout, stderr, code := runCommand(context.Background(), []string{"sh", "-c", "echo err >&2"}, "", "", "")
 		assert.Equal(t, "", stdout)
 		assert.Equal(t, "err\n", stderr)
 		assert.Equal(t, 0, code)
 	})
 
 	t.Run("non-existent binary returns exitCode 1", func(t *testing.T) {
-		_, _, code := runCommand(context.Background(), []string{"/no/such/binary/xyzzy"}, "", "")
+		_, _, code := runCommand(context.Background(), []string{"/no/such/binary/xyzzy"}, "", "", "")
 		assert.Equal(t, 1, code)
 	})
 
@@ -429,7 +433,7 @@ func TestRunCommand(t *testing.T) {
 		// Set a sentinel in the test process env; the subprocess must not see it.
 		t.Setenv("PROXY_TEST_SENTINEL", "super_secret_sentinel_12345")
 
-		stdout, _, code := runCommand(context.Background(), []string{"sh", "-c", "echo ${PROXY_TEST_SENTINEL:-NOT_SET}"}, "", "")
+		stdout, _, code := runCommand(context.Background(), []string{"sh", "-c", "echo ${PROXY_TEST_SENTINEL:-NOT_SET}"}, "", "", "")
 		assert.Equal(t, 0, code)
 		assert.NotContains(t, stdout, "super_secret_sentinel_12345",
 			"subprocess should not inherit test env vars")
@@ -437,7 +441,7 @@ func TestRunCommand(t *testing.T) {
 
 	t.Run("cwd is set when non-empty", func(t *testing.T) {
 		dir := t.TempDir()
-		stdout, _, code := runCommand(context.Background(), []string{"sh", "-c", "pwd"}, "", dir)
+		stdout, _, code := runCommand(context.Background(), []string{"sh", "-c", "pwd"}, "", dir, "")
 		assert.Equal(t, 0, code)
 		// macOS resolves /var to /private/var, so check suffix rather than equality.
 		assert.Contains(t, strings.TrimSpace(stdout), filepath.Base(dir))

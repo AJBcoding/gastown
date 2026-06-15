@@ -126,7 +126,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 	cwd := resolveBdCwd(s.cfg.TownRoot, argv)
-	out, errOut, exitCode := runCommand(execCtx, argv, identity, cwd)
+	out, errOut, exitCode := runCommand(execCtx, argv, identity, cwd, s.cfg.TownRoot)
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
 	if exitCode == 0 {
@@ -278,7 +278,7 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 	return v.(*rate.Limiter)
 }
 
-func runCommand(ctx context.Context, argv []string, identity, cwd string) (stdout, stderr string, exitCode int) {
+func runCommand(ctx context.Context, argv []string, identity, cwd, townRoot string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	if cwd != "" {
 		cmd.Dir = cwd
@@ -292,6 +292,16 @@ func runCommand(ctx context.Context, argv []string, identity, cwd string) (stdou
 	// scope mail, beads attribution, and role-aware output to the caller —
 	// not to whatever role the server happens to be running as (gh#gt-muo).
 	env := append(minimalEnv(), identityEnv(identity)...)
+	// Inject GT_TOWN_ROOT so the forwarded gt/bd subprocess passes the Gas Town
+	// workspace gate. minimalEnv() strips the server's env, and the subprocess
+	// cwd is not guaranteed to sit inside the town tree, so without this anchor
+	// commands like `gt prime`/`gt mail` fail with "not in a Gas Town workspace"
+	// — workspace.Find falls back to GT_TOWN_ROOT only if it is present (gt-kpi).
+	// Gated on identity so a non-mTLS request (tests only; production enforces
+	// client certs) keeps the empty-env isolation contract.
+	if identity != "" && townRoot != "" {
+		env = append(env, "GT_TOWN_ROOT="+townRoot)
+	}
 	cmd.Env = env
 	err := cmd.Run()
 	if err != nil {
