@@ -327,27 +327,33 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalWisps, totalMail int
+			var totalWisps, totalMail, totalQuarantined int
 			for _, r := range results {
 				prefix := ""
 				if r.DryRun {
 					prefix = "[DRY RUN] would "
 				}
-				fmt.Printf("%s: %spurged %d wisps, %d mail\n",
+				quarantined := r.WispsQuarantined + r.MailQuarantined
+				fmt.Printf("%s: %spurged %d wisps, %d mail",
 					r.Database, prefix, r.WispsPurged, r.MailPurged)
+				if quarantined > 0 {
+					fmt.Printf(", quarantined %d corrupt (gt-ybj/#11131)", quarantined)
+				}
+				fmt.Println()
 				for _, a := range r.Anomalies {
 					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
 				}
 				totalWisps += r.WispsPurged
 				totalMail += r.MailPurged
+				totalQuarantined += quarantined
 			}
 			if len(results) > 1 {
 				prefix := ""
 				if reaperDryRun {
 					prefix = "[DRY RUN] "
 				}
-				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail\n",
-					prefix, len(results), totalWisps, totalMail)
+				fmt.Printf("\n%sPurge summary (%d databases): purged %d wisps, %d mail, quarantined %d corrupt\n",
+					prefix, len(results), totalWisps, totalMail, totalQuarantined)
 			}
 		}
 		return nil

@@ -1,6 +1,7 @@
 package reaper
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"strings"
@@ -232,21 +233,24 @@ func TestIsNothingToCommit(t *testing.T) {
 	}
 }
 
-func TestIsRetryableConnErr(t *testing.T) {
+func TestIsConnDeadErr(t *testing.T) {
 	cases := []struct {
 		msg  string
 		want bool
 	}{
-		// gt-ybj signatures: the reaper's batch-write path tears down the
-		// connection with these errors while reads stay healthy.
+		// gt-ybj/#11131 signatures: a DELETE on a corrupt row panics Dolt and
+		// tears down the connection. The first statement sees EOF; subsequent
+		// statements on the pinned conn see "connection is already closed".
 		{"invalid connection", true},
 		{"Error 1105: invalid connection", true},
 		{"packets.go:58 unexpected EOF", true},
 		{"unexpected EOF", true},
+		{"sql: connection is already closed", true},
+		{"delete wisps batch: sql: connection is already closed", true},
 		{"write: broken pipe", true},
 		{"read: connection reset by peer", true},
 		{"INVALID CONNECTION", true}, // case-insensitive
-		// Non-transient errors must not be retried.
+		// Non-connection errors must not be treated as poison.
 		{"nothing to commit", false},
 		{"table not found: wisps", false},
 		{"syntax error near 'DELETE'", false},
@@ -257,18 +261,111 @@ func TestIsRetryableConnErr(t *testing.T) {
 		if c.msg != "" {
 			err = fmt.Errorf("%s", c.msg)
 		}
-		if got := isRetryableConnErr(err); got != c.want {
-			t.Errorf("isRetryableConnErr(%q) = %v, want %v", c.msg, got, c.want)
+		if got := isConnDeadErr(err); got != c.want {
+			t.Errorf("isConnDeadErr(%q) = %v, want %v", c.msg, got, c.want)
 		}
 	}
 
-	// driver.ErrBadConn (and anything wrapping it) is always retryable, even
-	// though its message text does not match the substrings above.
-	if !isRetryableConnErr(driver.ErrBadConn) {
-		t.Error("isRetryableConnErr(driver.ErrBadConn) = false, want true")
+	// driver.ErrBadConn and sql.ErrConnDone (and anything wrapping them) are
+	// always connection-death, even though their text differs.
+	if !isConnDeadErr(driver.ErrBadConn) {
+		t.Error("isConnDeadErr(driver.ErrBadConn) = false, want true")
 	}
-	if !isRetryableConnErr(fmt.Errorf("delete wisps batch: %w", driver.ErrBadConn)) {
-		t.Error("isRetryableConnErr(wrapped driver.ErrBadConn) = false, want true")
+	if !isConnDeadErr(sql.ErrConnDone) {
+		t.Error("isConnDeadErr(sql.ErrConnDone) = false, want true")
+	}
+	if !isConnDeadErr(fmt.Errorf("delete wisps batch: %w", driver.ErrBadConn)) {
+		t.Error("isConnDeadErr(wrapped driver.ErrBadConn) = false, want true")
+	}
+}
+
+// TestBisectDelete verifies the best-effort delete isolates poison rows (whose
+// DELETE panics the connection) by binary search, deletes all healthy rows, and
+// quarantines exactly the poison rows — without re-attempting them.
+func TestBisectDelete(t *testing.T) {
+	makeTry := func(poison map[string]bool, calls *int) func([]string) error {
+		return func(chunk []string) error {
+			*calls++
+			for _, id := range chunk {
+				if poison[id] {
+					// Simulate Dolt's connection-death panic on a corrupt row.
+					return fmt.Errorf("delete batch: %w", sql.ErrConnDone)
+				}
+			}
+			return nil
+		}
+	}
+	ids := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("id-%02d", i)
+		}
+		return out
+	}
+
+	t.Run("no poison deletes everything in one call", func(t *testing.T) {
+		calls := 0
+		got, poison, err := bisectDelete(ids(8), makeTry(map[string]bool{}, &calls))
+		if err != nil || got != 8 || len(poison) != 0 {
+			t.Fatalf("deleted=%d poison=%v err=%v; want deleted=8 poison=[] err=nil", got, poison, err)
+		}
+		if calls != 1 {
+			t.Errorf("healthy batch took %d calls, want 1", calls)
+		}
+	})
+
+	t.Run("single poison isolated, rest deleted", func(t *testing.T) {
+		calls := 0
+		got, poison, err := bisectDelete(ids(8), makeTry(map[string]bool{"id-03": true}, &calls))
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if got != 7 {
+			t.Errorf("deleted=%d, want 7", got)
+		}
+		if len(poison) != 1 || poison[0] != "id-03" {
+			t.Errorf("poison=%v, want [id-03]", poison)
+		}
+	})
+
+	t.Run("all poison quarantined, none deleted", func(t *testing.T) {
+		calls := 0
+		all := map[string]bool{"id-00": true, "id-01": true, "id-02": true, "id-03": true}
+		got, poison, err := bisectDelete(ids(4), makeTry(all, &calls))
+		if err != nil || got != 0 || len(poison) != 4 {
+			t.Fatalf("deleted=%d poison=%v err=%v; want deleted=0 poison=4 err=nil", got, poison, err)
+		}
+	})
+
+	t.Run("non-connection error is surfaced, not bisected", func(t *testing.T) {
+		calls := 0
+		try := func(chunk []string) error {
+			calls++
+			return fmt.Errorf("syntax error")
+		}
+		got, poison, err := bisectDelete(ids(8), try)
+		if err == nil {
+			t.Fatal("expected error to be surfaced")
+		}
+		if got != 0 || len(poison) != 0 {
+			t.Errorf("deleted=%d poison=%v, want 0/[]", got, poison)
+		}
+		if calls != 1 {
+			t.Errorf("non-conn error bisected (%d calls), want 1", calls)
+		}
+	})
+}
+
+// TestNotInClause verifies the quarantine-exclusion clause builder.
+func TestNotInClause(t *testing.T) {
+	if got := notInClause("w.id", 0); got != "" {
+		t.Errorf("notInClause(0) = %q, want empty", got)
+	}
+	if got := notInClause("w.id", 1); got != " AND w.id NOT IN (?)" {
+		t.Errorf("notInClause(1) = %q", got)
+	}
+	if got := notInClause("i.id", 3); got != " AND i.id NOT IN (?,?,?)" {
+		t.Errorf("notInClause(3) = %q", got)
 	}
 }
 

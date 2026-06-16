@@ -52,28 +52,27 @@ func isTableNotFound(err error) bool {
 	return strings.Contains(msg, "table not found") || strings.Contains(msg, "doesn't exist")
 }
 
-// connRetryAttempts bounds how many times a write transaction is retried when a
-// transient connection-level error is hit. Dolt occasionally tears a connection
-// down mid-write (e.g. the daemon's long-running-query KILL); a fresh connection
-// usually succeeds on the next attempt.
-const connRetryAttempts = 3
-
-// isRetryableConnErr reports whether err is a transient connection-level failure
-// that warrants retrying the operation on a fresh connection.
+// isConnDeadErr reports whether err means the backend connection died — the
+// gt-ybj signature. On gt-ybj/#11131 a DELETE against a row with a corrupt
+// adaptive-TEXT value makes Dolt panic in its connection-handler goroutine
+// (store/val/adaptive_value.go "invalid hash length: 19"); the panic is
+// recovered server-side but the TCP connection is torn down, so the client sees
+// "unexpected EOF" on the failing statement and "sql: connection is already
+// closed" (sql.ErrConnDone) on any subsequent statement on that pinned conn.
 //
-// This is the gt-ybj signature: reads/single-statement writes succeed, but the
-// reaper's batch-write transactions fail with "invalid connection" /
-// "packets.go: unexpected EOF" when the underlying connection is recycled or
-// killed mid-transaction.
-func isRetryableConnErr(err error) bool {
+// The best-effort purge uses this to detect a poison row: a delete whose
+// connection dies marks its id-set as containing corruption to be bisected and
+// quarantined, rather than failing the whole purge.
+func isConnDeadErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, driver.ErrBadConn) {
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "invalid connection") ||
+		strings.Contains(msg, "connection is already closed") ||
 		strings.Contains(msg, "unexpected eof") ||
 		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection reset")
@@ -81,48 +80,29 @@ func isRetryableConnErr(err error) bool {
 
 // withConn runs fn against a single dedicated connection checked out from the
 // pool, so that every session-stateful statement in a reaper write transaction
-// (SET @@autocommit, the batch DELETE/UPDATEs, COMMIT, CALL DOLT_COMMIT) runs on
-// the SAME backend connection.
+// (SET @@autocommit, the DELETE/UPDATEs, COMMIT, CALL DOLT_COMMIT) runs on the
+// SAME backend connection.
 //
-// gt-ybj root cause: issuing those statements against the pooled *sql.DB
-// directly routed each one to an arbitrary connection. autocommit=0 leaked into
-// pooled connections, the "transaction" was split across multiple backends, and
-// a connection recycled by SetConnMaxLifetime/SetConnMaxIdleTime (or killed by
-// the Dolt daemon) surfaced on reuse as driver.ErrBadConn — the
-// "invalid connection"/EOF failure that hit every database regardless of size.
-//
-// On a transient connection error fn is retried with a fresh connection, so fn
-// MUST be idempotent. The reaper write functions satisfy this: each attempt
-// re-SELECTs its candidate set and persists only via an explicit COMMIT at the
-// end, so a mid-transaction failure rolls back cleanly and the retry starts
-// from a consistent state.
+// gt-ybj: issuing those statements against the pooled *sql.DB directly routed
+// each one to an arbitrary connection. autocommit=0 leaked into pooled
+// connections, the "transaction" was split across multiple backends, and a
+// recycled connection surfaced on reuse as driver.ErrBadConn. Pinning one
+// connection eliminates that. There is no retry here — a dead connection on the
+// purge path means a Dolt panic on a corrupt row (#11131), which is
+// deterministic; the best-effort purge handles it by bisecting and quarantining
+// the poison row instead of blindly retrying.
 func withConn(ctx context.Context, db *sql.DB, fn func(conn *sql.Conn) error) error {
-	var lastErr error
-	for attempt := 0; attempt < connRetryAttempts; attempt++ {
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			lastErr = fmt.Errorf("acquire connection: %w", err)
-			if isRetryableConnErr(err) {
-				continue
-			}
-			return lastErr
-		}
-
-		err = fn(conn)
-		// Reset session state and return the connection to the pool. A bad
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer func() {
+		// Reset session state and return the connection to the pool. A dead
 		// connection is discarded by Close(); a healthy one is recycled clean.
 		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
 		_ = conn.Close()
-
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !isRetryableConnErr(err) {
-			return err
-		}
-	}
-	return lastErr
+	}()
+	return fn(conn)
 }
 
 func scanStaleCandidatesQuery(splitTarget bool) string {
@@ -232,11 +212,16 @@ type ReapResult struct {
 
 // PurgeResult holds the results of a purge operation.
 type PurgeResult struct {
-	Database    string    `json:"database"`
-	WispsPurged int       `json:"wisps_purged"`
-	MailPurged  int       `json:"mail_purged"`
-	DryRun      bool      `json:"dry_run,omitempty"`
-	Anomalies   []Anomaly `json:"anomalies,omitempty"`
+	Database    string `json:"database"`
+	WispsPurged int    `json:"wisps_purged"`
+	MailPurged  int    `json:"mail_purged"`
+	// WispsQuarantined / MailQuarantined count rows newly quarantined this run
+	// because their DELETE panicked Dolt on a corrupt adaptive-value row
+	// (gt-ybj/#11131). Quarantined rows are skipped by future purges.
+	WispsQuarantined int       `json:"wisps_quarantined,omitempty"`
+	MailQuarantined  int       `json:"mail_quarantined,omitempty"`
+	DryRun           bool      `json:"dry_run,omitempty"`
+	Anomalies        []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -572,33 +557,41 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 }
 
 // Purge deletes old closed wisps and mail from a database.
+//
+// Purge is best-effort (gt-ybj/#11131): rows whose DELETE panics Dolt because of
+// a corrupt adaptive-value encoding are isolated by binary search, quarantined
+// (so future purges skip them and never re-panic), and reported — the healthy
+// rows are still deleted and the purge exits successfully. This keeps the
+// reaper/hygiene molecule unblocked while the underlying data corruption is
+// repaired separately.
 func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dryRun bool) (*PurgeResult, error) {
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	purged, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
+	purged, quarantined, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
 	result.WispsPurged = purged
+	result.WispsQuarantined = quarantined
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
 	// Purge old mail.
-	mailPurged, err := purgeOldMail(db, dbName, mailDeleteAge, dryRun)
+	mailPurged, mailQuarantined, err := purgeOldMail(db, dbName, mailDeleteAge, dryRun)
 	if err != nil {
 		return result, fmt.Errorf("purge mail: %w", err)
 	}
 	result.MailPurged = mailPurged
+	result.MailQuarantined = mailQuarantined
 
 	return result, nil
 }
 
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (int, []Anomaly, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (deleted int, quarantined int, anomalies []Anomaly, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	deleteCutoff := time.Now().UTC().Add(-purgeAge)
-	var anomalies []Anomaly
 
 	// Digest: count by wisp_type.
 	// No parent check — closed wisps past the delete age are unconditionally purgeable.
@@ -607,77 +600,39 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype"
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
-		return 0, nil, fmt.Errorf("digest query: %w", err)
+		return 0, 0, nil, fmt.Errorf("digest query: %w", err)
 	}
 	digestTotal := 0
 	for rows.Next() {
 		var wtype string
 		var cnt int
-		if err := rows.Scan(&wtype, &cnt); err != nil {
+		if scanErr := rows.Scan(&wtype, &cnt); scanErr != nil {
 			rows.Close()
-			return 0, nil, fmt.Errorf("digest scan: %w", err)
+			return 0, 0, nil, fmt.Errorf("digest scan: %w", scanErr)
 		}
 		digestTotal += cnt
 	}
 	rows.Close()
 
 	if digestTotal == 0 {
-		return 0, anomalies, nil
+		return 0, 0, nil, nil
 	}
 
 	if dryRun {
-		return digestTotal, anomalies, nil
+		return digestTotal, 0, nil, nil
 	}
 
-	// Batch delete — simple status+age filter, no parent check needed for purge.
-	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
-		DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
-
-	// All statements run on one pinned connection so the autocommit=0 transaction
-	// stays coherent (gt-ybj). The closure is re-run on a transient connection
-	// error, so reset the per-attempt outputs at the top.
-	totalDeleted := 0
-	err = withConn(ctx, db, func(conn *sql.Conn) error {
-		totalDeleted = 0
-		anomalies = nil
-
-		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-			return fmt.Errorf("disable autocommit: %w", err)
-		}
-
-		deleted, err := batchDeleteRows(ctx, conn, idQuery, deleteCutoff, "wisps", auxTables)
-		if err != nil {
-			return err
-		}
-		totalDeleted = deleted
-
-		if totalDeleted > 0 {
-			// Flush SQL transaction to working set before DOLT_COMMIT.
-			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-				return fmt.Errorf("sql commit: %w", err)
-			}
-			commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
-			if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-				// Non-fatal — log but continue.
-				anomalies = append(anomalies, Anomaly{
-					Type:    "dolt_commit_failed",
-					Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
-				})
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return totalDeleted, anomalies, err
+	candidateQuery := func(quarantined []string) string {
+		return fmt.Sprintf(
+			"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ?%s LIMIT %d",
+			notInClause("w.id", len(quarantined)), DefaultBatchSize)
 	}
-
-	return totalDeleted, anomalies, nil
+	return bestEffortPurge(ctx, db, dbName, "wisps", auxTables, true, candidateQuery, deleteCutoff)
 }
 
-func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (deleted int, quarantined int, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	mailCutoff := time.Now().UTC().Add(-mailDeleteAge)
@@ -686,57 +641,38 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 		"SELECT COUNT(*) FROM `%s`.issues WHERE status = 'closed' AND closed_at < ? AND id IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:message')",
 		dbName, dbName)
 	var count int
-	if err := db.QueryRowContext(ctx, countQuery, mailCutoff).Scan(&count); err != nil {
-		if isTableNotFound(err) {
-			return 0, nil // issues/labels not on this server
+	if scanErr := db.QueryRowContext(ctx, countQuery, mailCutoff).Scan(&count); scanErr != nil {
+		if isTableNotFound(scanErr) {
+			return 0, 0, nil // issues/labels not on this server
 		}
-		return 0, fmt.Errorf("count mail: %w", err)
+		return 0, 0, fmt.Errorf("count mail: %w", scanErr)
 	}
 	if count == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	if dryRun {
-		return count, nil
+		return count, 0, nil
 	}
 
-	idQuery := fmt.Sprintf(
-		"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message' LIMIT %d",
-		dbName, dbName, DefaultBatchSize)
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
-
-	// One pinned connection for the whole autocommit=0 transaction (gt-ybj).
-	totalDeleted := 0
-	err := withConn(ctx, db, func(conn *sql.Conn) error {
-		totalDeleted = 0
-
-		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-			return fmt.Errorf("disable autocommit: %w", err)
-		}
-
-		deleted, err := batchDeleteRows(ctx, conn, idQuery, mailCutoff, "issues", auxTables)
-		if err != nil {
-			return err
-		}
-		totalDeleted = deleted
-
-		if totalDeleted > 0 {
-			// Flush SQL transaction to working set before DOLT_COMMIT.
-			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-				return fmt.Errorf("sql commit: %w", err)
-			}
-			commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
-			if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-				// Non-fatal.
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return totalDeleted, err
+	candidateQuery := func(quarantined []string) string {
+		return fmt.Sprintf(
+			"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message'%s LIMIT %d",
+			dbName, dbName, notInClause("i.id", len(quarantined)), DefaultBatchSize)
 	}
+	deleted, quarantined, _, err = bestEffortPurge(ctx, db, dbName, "issues", auxTables, false, candidateQuery, mailCutoff)
+	return deleted, quarantined, err
+}
 
-	return totalDeleted, nil
+// notInClause returns " AND <col> NOT IN (?,?,...)" with n placeholders, or "" if
+// n == 0. Used to exclude already-quarantined poison ids from the candidate set
+// so they are never re-attempted (and never re-panic).
+func notInClause(col string, n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" AND %s NOT IN (%s)", col, strings.TrimSuffix(strings.Repeat("?,", n), ","))
 }
 
 func autoCloseWhereClause(dbName string, splitTarget bool) string {
@@ -883,67 +819,240 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	return result, nil
 }
 
-// batchDeleteRows deletes rows from a primary table and its auxiliary tables in
-// batches. It runs every statement on the supplied pinned connection so the
-// surrounding autocommit=0 transaction stays coherent on a single backend (see
-// withConn / gt-ybj). Each batch is committed to the SQL transaction working set
-// by the caller's final COMMIT.
-func batchDeleteRows(ctx context.Context, conn *sql.Conn, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
-	totalDeleted := 0
-	for {
-		idRows, err := conn.QueryContext(ctx, idQuery, cutoffArg)
-		if err != nil {
-			return totalDeleted, fmt.Errorf("select batch: %w", err)
-		}
+// quarantineTable is the per-database bookkeeping table that records rows whose
+// DELETE panics Dolt on a corrupt adaptive-value encoding (gt-ybj/#11131). Future
+// purges exclude these ids so they are never re-attempted (and never re-panic).
+// The table is created lazily, only when the first poison row is found, so
+// uncorrupted databases never gain it.
+const quarantineTable = "_gt_reaper_quarantine"
 
+// bestEffortPurge deletes all candidate rows of primaryTable (+ auxTables),
+// quarantining any "poison" row whose DELETE tears down the connection via a Dolt
+// panic (gt-ybj/#11131). It returns the number deleted, the number newly
+// quarantined this run, any anomalies, and an error only for non-corruption
+// failures.
+//
+// candidateQuery(quarantined) must return a SELECT of up to DefaultBatchSize
+// candidate ids, taking the delete cutoff as its first bind arg and excluding the
+// supplied already-quarantined ids (via notInClause) so the batch always makes
+// forward progress.
+//
+// reverseDep deletes dangling wisp_dependencies parent refs (wisps only).
+func bestEffortPurge(ctx context.Context, db *sql.DB, dbName, primaryTable string, auxTables []string, reverseDep bool, candidateQuery func(quarantined []string) string, cutoff time.Time) (deleted int, quarantined int, anomalies []Anomaly, err error) {
+	// Load previously-quarantined ids so we never re-attempt (and re-panic on) them.
+	quarantinedIDs, err := loadQuarantine(ctx, db, dbName, primaryTable)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("load quarantine: %w", err)
+	}
+
+	var newlyQuarantined []string
+	for {
+		// Select the next batch of candidate ids, excluding everything quarantined
+		// (both pre-existing and found this run).
+		args := make([]interface{}, 0, 1+len(quarantinedIDs))
+		args = append(args, cutoff)
+		for _, id := range quarantinedIDs {
+			args = append(args, id)
+		}
+		idRows, qErr := db.QueryContext(ctx, candidateQuery(quarantinedIDs), args...)
+		if qErr != nil {
+			return deleted, len(newlyQuarantined), anomalies, fmt.Errorf("select batch: %w", qErr)
+		}
 		var ids []string
 		for idRows.Next() {
 			var id string
-			if err := idRows.Scan(&id); err != nil {
+			if scanErr := idRows.Scan(&id); scanErr != nil {
 				idRows.Close()
-				return totalDeleted, fmt.Errorf("scan id: %w", err)
+				return deleted, len(newlyQuarantined), anomalies, fmt.Errorf("scan id: %w", scanErr)
 			}
 			ids = append(ids, id)
 		}
 		idRows.Close()
-
 		if len(ids) == 0 {
 			break
 		}
 
-		placeholders := make([]string, len(ids))
+		// Delete the batch, isolating and quarantining poison rows by binary search.
+		d, poison, bErr := bisectDelete(ids, func(chunk []string) error {
+			return deleteIDSetTxn(ctx, db, chunk, primaryTable, auxTables, reverseDep)
+		})
+		deleted += d
+		if bErr != nil {
+			// A genuine (non-corruption) error — surface it but keep whatever we deleted.
+			anomalies = append(anomalies, Anomaly{
+				Type:    "delete_error",
+				Message: fmt.Sprintf("delete %s batch: %v", primaryTable, bErr),
+			})
+			break
+		}
+		if len(poison) > 0 {
+			newlyQuarantined = append(newlyQuarantined, poison...)
+			quarantinedIDs = append(quarantinedIDs, poison...)
+		}
+	}
+
+	// Persist newly-found poison rows so future purges skip them.
+	if len(newlyQuarantined) > 0 {
+		if qErr := quarantineIDs(ctx, db, dbName, primaryTable, newlyQuarantined); qErr != nil {
+			anomalies = append(anomalies, Anomaly{
+				Type:    "quarantine_failed",
+				Message: fmt.Sprintf("failed to persist %d quarantined %s rows: %v", len(newlyQuarantined), primaryTable, qErr),
+			})
+		}
+	}
+
+	// Commit the deletions (and any quarantine inserts) to Dolt history.
+	if deleted > 0 || len(newlyQuarantined) > 0 {
+		if cErr := doltCommit(ctx, db, fmt.Sprintf("reaper: purge %s in %s (deleted %d, quarantined %d)", primaryTable, dbName, deleted, len(newlyQuarantined))); cErr != nil && !isNothingToCommit(cErr) {
+			anomalies = append(anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after purge failed: %v", cErr),
+			})
+		}
+	}
+
+	return deleted, len(newlyQuarantined), anomalies, nil
+}
+
+// bisectDelete deletes the ids by calling tryDelete on the whole set, and on a
+// connection-death (a Dolt panic on a corrupt row, gt-ybj/#11131) recursively
+// bisects to isolate the poison id(s). Healthy chunks cost one tryDelete call;
+// only chunks containing poison incur extra (log n) calls.
+//
+// Returns the count successfully deleted, the list of poison ids that must be
+// quarantined, and a non-nil error only for a genuine non-corruption failure.
+func bisectDelete(ids []string, tryDelete func(chunk []string) error) (deleted int, poison []string, err error) {
+	if len(ids) == 0 {
+		return 0, nil, nil
+	}
+	derr := tryDelete(ids)
+	if derr == nil {
+		return len(ids), nil, nil
+	}
+	if !isConnDeadErr(derr) {
+		// Genuine error, not a poison-row panic — do not bisect.
+		return 0, nil, derr
+	}
+	if len(ids) == 1 {
+		// Single row whose DELETE panics Dolt → poison, quarantine it.
+		return 0, ids, nil
+	}
+	mid := len(ids) / 2
+	dL, pL, eL := bisectDelete(ids[:mid], tryDelete)
+	if eL != nil {
+		return dL, pL, eL
+	}
+	dR, pR, eR := bisectDelete(ids[mid:], tryDelete)
+	return dL + dR, append(pL, pR...), eR
+}
+
+// deleteIDSetTxn deletes the given ids from primaryTable and auxTables in one
+// pinned-connection autocommit=0 transaction, committing only on full success so
+// a mid-transaction connection death rolls back cleanly. It returns an error for
+// which isConnDeadErr is true when the backend connection dies (the gt-ybj/#11131
+// poison-row panic), letting the caller bisect.
+func deleteIDSetTxn(ctx context.Context, db *sql.DB, ids []string, primaryTable string, auxTables []string, reverseDep bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return withConn(ctx, db, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
+		}
+
 		args := make([]interface{}, len(ids))
+		placeholders := make([]string, len(ids))
 		for i, id := range ids {
-			placeholders[i] = "?"
 			args[i] = id
+			placeholders[i] = "?"
 		}
 		inClause := "(" + strings.Join(placeholders, ",") + ")"
 
+		// Auxiliary tables: tolerate non-connection errors (e.g. a missing aux
+		// table on this server) but abort on a connection death so the caller
+		// bisects rather than silently skipping the poison row.
 		for _, tbl := range auxTables {
 			delAux := fmt.Sprintf("DELETE FROM `%s` WHERE issue_id IN %s", tbl, inClause) //nolint:gosec // G201: tbl is internal
-			if _, err := conn.ExecContext(ctx, delAux, args...); err != nil {
-				// Non-fatal: log and continue.
+			if _, err := conn.ExecContext(ctx, delAux, args...); err != nil && isConnDeadErr(err) {
+				return err
 			}
 		}
 
-		// Clean up reverse dependency references to prevent dangling parent refs.
-		if err := retryDependencyTargetQuery(func(splitTarget bool) error {
-			_, execErr := conn.ExecContext(ctx, reverseWispDependencyDeleteQuery(inClause, splitTarget), args...)
-			return execErr
-		}); err != nil {
-			// Non-fatal.
+		if reverseDep {
+			// Clean up reverse dependency references to prevent dangling parent refs.
+			if err := retryDependencyTargetQuery(func(splitTarget bool) error {
+				_, execErr := conn.ExecContext(ctx, reverseWispDependencyDeleteQuery(inClause, splitTarget), args...)
+				return execErr
+			}); err != nil && isConnDeadErr(err) {
+				return err
+			}
 		}
 
 		delPrimary := fmt.Sprintf("DELETE FROM `%s` WHERE id IN %s", primaryTable, inClause) //nolint:gosec // G201: primaryTable is internal
-		sqlResult, err := conn.ExecContext(ctx, delPrimary, args...)
-		if err != nil {
-			return totalDeleted, fmt.Errorf("delete %s batch: %w", primaryTable, err)
+		if _, err := conn.ExecContext(ctx, delPrimary, args...); err != nil {
+			return err
 		}
-		affected, _ := sqlResult.RowsAffected()
-		totalDeleted += int(affected)
-	}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return err
+		}
+		return nil
+	})
+}
 
-	return totalDeleted, nil
+// loadQuarantine returns the ids already quarantined for primaryTable in dbName.
+// Returns an empty list (no error) when the quarantine table does not yet exist.
+func loadQuarantine(ctx context.Context, db *sql.DB, dbName, primaryTable string) ([]string, error) {
+	q := fmt.Sprintf("SELECT id FROM `%s`.`%s` WHERE table_name = ?", dbName, quarantineTable)
+	rows, err := db.QueryContext(ctx, q, primaryTable)
+	if err != nil {
+		if isTableNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// quarantineIDs records poison ids in the per-database quarantine table, creating
+// it lazily. The inserts land in the Dolt working set; the caller's doltCommit
+// captures them along with the purge deletions.
+func quarantineIDs(ctx context.Context, db *sql.DB, dbName, primaryTable string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return withConn(ctx, db, func(conn *sql.Conn) error {
+		createStmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s` ("+
+			"table_name VARCHAR(64) NOT NULL, id VARCHAR(255) NOT NULL, db_name VARCHAR(128), "+
+			"reason VARCHAR(255), quarantined_at DATETIME, PRIMARY KEY (table_name, id))", dbName, quarantineTable)
+		if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+			return fmt.Errorf("create quarantine table: %w", err)
+		}
+		insertStmt := fmt.Sprintf("INSERT IGNORE INTO `%s`.`%s` (table_name, id, db_name, reason, quarantined_at) VALUES (?, ?, ?, ?, NOW())", dbName, quarantineTable)
+		for _, id := range ids {
+			if _, err := conn.ExecContext(ctx, insertStmt, primaryTable, id, dbName,
+				"delete-panic: corrupt adaptive-value row (gt-ybj/#11131)"); err != nil {
+				return fmt.Errorf("insert quarantine id %q: %w", id, err)
+			}
+		}
+		return nil
+	})
+}
+
+// doltCommit flushes the working set to Dolt history with the given message.
+func doltCommit(ctx context.Context, db *sql.DB, message string) error {
+	return withConn(ctx, db, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", message)) //nolint:gosec // G201: message from safe values
+		return err
+	})
 }
 
 // ClosePluginReceiptResult holds the results of closing plugin run receipts.

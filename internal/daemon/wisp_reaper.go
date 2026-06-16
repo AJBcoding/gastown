@@ -199,6 +199,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 
 	// Step 3: Purge
 	purgeErrors := 0
+	totalQuarantined := 0
 	for _, dbName := range databases {
 		if err := reaper.ValidateDBName(dbName); err != nil {
 			continue
@@ -221,9 +222,19 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 		totalPurged += result.WispsPurged
 		totalMailPurged += result.MailPurged
+		quarantined := result.WispsQuarantined + result.MailQuarantined
+		totalQuarantined += quarantined
+		if quarantined > 0 {
+			// Corrupt rows whose DELETE panics Dolt (gt-ybj/#11131) are quarantined
+			// and skipped on future purges so the step succeeds instead of failing.
+			d.logger.Printf("wisp_reaper: %s: quarantined %d corrupt rows (gt-ybj/#11131)", dbName, quarantined)
+		}
 		for _, a := range result.Anomalies {
 			d.logger.Printf("wisp_reaper: %s: ANOMALY: %s", dbName, a.Message)
 		}
+	}
+	if totalQuarantined > 0 {
+		d.logger.Printf("wisp_reaper: quarantined %d corrupt rows total (skipped on future purges)", totalQuarantined)
 	}
 	if purgeErrors > 0 {
 		mol.failStep("purge", fmt.Sprintf("%d databases had purge errors", purgeErrors))
