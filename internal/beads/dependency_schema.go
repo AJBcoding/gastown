@@ -147,6 +147,24 @@ func IsDependencyTargetColumnError(err error) bool {
 	return false
 }
 
+// IsCorruptAdaptiveValueError reports whether err is the Dolt #11131 corruption
+// surfaced on a READ/scan path: decoding a malformed 19-byte adaptive-TEXT value
+// (written by a past Dolt version) makes Dolt panic with "invalid hash length".
+// On the DELETE path the same corruption instead tears down the connection
+// (handled by the reaper's best-effort quarantine, gt-ybj); on read/scan paths
+// the recovered panic is returned to the client as an Error 1105, e.g.
+// "Error 1105 (HY000): panic recovered: invalid hash length: 19".
+//
+// Callers that scan rows (convoy event poller, orphan scans) use this to skip
+// past the corrupt data gracefully instead of failing/retrying every cycle.
+func IsCorruptAdaptiveValueError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "invalid hash length")
+}
+
 // IsDependencyTargetGeneratedWriteError reports whether a write attempted to
 // assign the generated legacy target column in bd's split dependency schema.
 func IsDependencyTargetGeneratedWriteError(err error) bool {

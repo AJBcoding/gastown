@@ -166,3 +166,28 @@ func TestIsDependencyTargetGeneratedWriteError(t *testing.T) {
 		t.Fatal("unexpected generated-column write match without generated marker")
 	}
 }
+
+func TestIsCorruptAdaptiveValueError(t *testing.T) {
+	corrupt := []error{
+		errors.New("Error 1105 (HY000): panic recovered: invalid hash length: 19"),
+		errors.New("get events since 1970-01-01 00:00:00 +0000 UTC: Error 1105 (HY000): panic recovered: invalid hash length: 19"),
+		errors.New("INVALID HASH LENGTH: 19"), // case-insensitive
+	}
+	for _, err := range corrupt {
+		if !IsCorruptAdaptiveValueError(err) {
+			t.Errorf("expected #11131 corruption detected: %v", err)
+		}
+	}
+
+	notCorrupt := []error{
+		nil,
+		errors.New("Error 1105 (HY000): something else"),
+		errors.New("unexpected EOF"), // DELETE-path symptom, handled elsewhere (isConnDeadErr)
+		errors.New("nothing to commit"),
+	}
+	for _, err := range notCorrupt {
+		if IsCorruptAdaptiveValueError(err) {
+			t.Errorf("unexpected corruption match: %v", err)
+		}
+	}
+}

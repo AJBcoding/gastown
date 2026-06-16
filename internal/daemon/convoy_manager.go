@@ -303,6 +303,18 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			m.logger("Convoy: event poll (%s): +Inf/NaN row detected, advancing HWM to %s to skip corrupt data", name, now.Format(time.RFC3339))
 			return nil
 		}
+		if beads.IsCorruptAdaptiveValueError(err) {
+			// A row in the events table has a corrupt 19-byte adaptive-TEXT ref
+			// (Dolt #11131) that panics the scan ("invalid hash length"). Like the
+			// +Inf/NaN case, advance the high-water mark past it so future polls
+			// skip the corrupt history instead of re-panicking every cycle (which
+			// otherwise spams Dolt with recovered panics — gt-ui2). The stranded
+			// convoy scanner catches any completions missed in the skipped range.
+			now := time.Now().UTC()
+			m.lastEventIDs.Store(name, now)
+			m.logger("Convoy: event poll (%s): corrupt adaptive-value row (#11131) detected, advancing HWM to %s to skip (gt-ui2)", name, now.Format(time.RFC3339))
+			return nil
+		}
 		m.logger("Convoy: event poll error (%s): %v", name, err)
 		// Signal recovery mode so the stranded scan shortens its interval and
 		// retries quickly once Dolt comes back.

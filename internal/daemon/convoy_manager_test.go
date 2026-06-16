@@ -2381,6 +2381,62 @@ func (s *infNaNStorage) GetAllEventsSince(_ context.Context, _ time.Time) ([]*be
 	return nil, s.err
 }
 
+// TestPollStore_CorruptAdaptiveValue_AdvancesHWMAndReturnsNil verifies that when
+// GetAllEventsSince panics on a corrupt adaptive-value row (Dolt #11131,
+// "invalid hash length"), pollStore advances the high-water mark to now and
+// returns nil — skipping the corrupt history instead of re-panicking every cycle
+// (gt-ui2).
+func TestPollStore_CorruptAdaptiveValue_AdvancesHWMAndReturnsNil(t *testing.T) {
+	for _, errMsg := range []string{
+		"Error 1105 (HY000): panic recovered: invalid hash length: 19",
+		// Wrapped in beads SDK error context (actual observed format)
+		"get events since 1970-01-01 00:00:00 +0000 UTC: Error 1105 (HY000): panic recovered: invalid hash length: 19",
+	} {
+		t.Run(errMsg[:24], func(t *testing.T) {
+			stub := &infNaNStorage{err: fmt.Errorf("%s", errMsg)}
+			stores := map[string]beadsdk.Storage{"hq": stub}
+
+			var logged []string
+			logger := func(format string, args ...interface{}) {
+				logged = append(logged, fmt.Sprintf(format, args...))
+			}
+
+			before := time.Now()
+			m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+			hadError := m.pollStoresSnapshot(m.stores)
+			after := time.Now()
+
+			if hadError {
+				t.Errorf("expected no error for corrupt-adaptive-value store, got hadError=true; logs: %v", logged)
+			}
+			if m.recoveryMode.Load() {
+				t.Errorf("recoveryMode should not be set for corrupt-row error; logs: %v", logged)
+			}
+
+			v, ok := m.lastEventIDs.Load("hq")
+			if !ok {
+				t.Fatal("expected HWM to be stored for hq")
+			}
+			hwm := v.(time.Time)
+			if hwm.Before(before) || hwm.After(after.Add(time.Second)) {
+				t.Errorf("HWM %v not in expected range [%v, %v]", hwm, before, after)
+			}
+
+			foundMsg := false
+			for _, s := range logged {
+				if strings.Contains(s, "corrupt adaptive-value row (#11131)") {
+					foundMsg = true
+					break
+				}
+			}
+			if !foundMsg {
+				t.Errorf("expected corrupt-row HWM-advance log message, got: %v", logged)
+			}
+		})
+	}
+}
+
 // TestPollStore_InfNaNError_AdvancesHWMAndReturnsNil verifies that when
 // GetAllEventsSince returns a "+Inf is not a valid value for double" error
 // (corrupt Dolt row), pollStore advances the high-water mark to now and

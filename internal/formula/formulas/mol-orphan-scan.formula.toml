@@ -168,6 +168,15 @@ Wisps should have metadata indicating the spawning session.
 **4. Check for unsquashed content:**
 Orphaned wisps may have audit-worthy content that wasn't squashed.
 
+**5. Known non-actionable: #11131-corrupt closed wisps.**
+Closed wisps whose deletion/GC fails with `invalid hash length` / `unexpected EOF`
+/ `invalid connection` are KNOWN Dolt #11131-corrupt rows. `gt reaper purge` has
+already quarantined them (per-db `_gt_reaper_quarantine` table) and skips them.
+Do NOT count these as actionable orphans and do NOT escalate them as
+"blocked/orphaned" — nothing healthy is stuck behind them. Use `gt reaper purge`
+(quarantine-safe), never `bd mol wisp gc`, for closed-wisp cleanup. Tracked by
+gt-ybj / gt-ui2 (gastown) plus the bd-side fix bead.
+
 **Exit criteria:** Orphaned wisps identified."""
 
 [[steps]]
