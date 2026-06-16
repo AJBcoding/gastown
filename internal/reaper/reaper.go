@@ -215,13 +215,20 @@ type PurgeResult struct {
 	Database    string `json:"database"`
 	WispsPurged int    `json:"wisps_purged"`
 	MailPurged  int    `json:"mail_purged"`
-	// WispsQuarantined / MailQuarantined count rows newly quarantined this run
-	// because their DELETE panicked Dolt on a corrupt adaptive-value row
-	// (gt-ybj/#11131). Quarantined rows are skipped by future purges.
-	WispsQuarantined int       `json:"wisps_quarantined,omitempty"`
-	MailQuarantined  int       `json:"mail_quarantined,omitempty"`
-	DryRun           bool      `json:"dry_run,omitempty"`
-	Anomalies        []Anomaly `json:"anomalies,omitempty"`
+	// WispsQuarantined / MailQuarantined are the total corrupt rows quarantined
+	// for this database's wisps / issues tables — rows whose DELETE panics Dolt
+	// on a corrupt adaptive-value encoding (gt-ybj/#11131). They are excluded
+	// from the purge candidate set (and from "would purge" dry-run counts) and
+	// skipped by every future purge, so they never re-panic. Always emitted (not
+	// omitempty) so the count is visible even when zero.
+	WispsQuarantined int `json:"wisps_quarantined"`
+	MailQuarantined  int `json:"mail_quarantined"`
+	// WispsNewlyQuarantined / MailNewlyQuarantined are the rows newly quarantined
+	// during this run (a subset of the totals above).
+	WispsNewlyQuarantined int       `json:"wisps_newly_quarantined,omitempty"`
+	MailNewlyQuarantined  int       `json:"mail_newly_quarantined,omitempty"`
+	DryRun                bool      `json:"dry_run,omitempty"`
+	Anomalies             []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ClosedEntry records an individual issue closure with details for logging.
@@ -568,58 +575,54 @@ func Purge(db *sql.DB, dbName string, purgeAge, mailDeleteAge time.Duration, dry
 	result := &PurgeResult{Database: dbName, DryRun: dryRun}
 
 	// Purge closed wisps.
-	purged, quarantined, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
+	purged, totalQ, newQ, anomalies, err := purgeClosedWisps(db, dbName, purgeAge, dryRun)
 	if err != nil {
 		return nil, fmt.Errorf("purge wisps: %w", err)
 	}
 	result.WispsPurged = purged
-	result.WispsQuarantined = quarantined
+	result.WispsQuarantined = totalQ
+	result.WispsNewlyQuarantined = newQ
 	result.Anomalies = append(result.Anomalies, anomalies...)
 
 	// Purge old mail.
-	mailPurged, mailQuarantined, err := purgeOldMail(db, dbName, mailDeleteAge, dryRun)
+	mailPurged, mailTotalQ, mailNewQ, err := purgeOldMail(db, dbName, mailDeleteAge, dryRun)
 	if err != nil {
 		return result, fmt.Errorf("purge mail: %w", err)
 	}
 	result.MailPurged = mailPurged
-	result.MailQuarantined = mailQuarantined
+	result.MailQuarantined = mailTotalQ
+	result.MailNewlyQuarantined = mailNewQ
 
 	return result, nil
 }
 
-func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (deleted int, quarantined int, anomalies []Anomaly, err error) {
+func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun bool) (deleted, totalQuarantined, newlyQuarantined int, anomalies []Anomaly, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	deleteCutoff := time.Now().UTC().Add(-purgeAge)
 
-	// Digest: count by wisp_type.
-	// No parent check — closed wisps past the delete age are unconditionally purgeable.
-	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
-	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
-	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype"
-	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
+	// Load already-quarantined poison ids so they are excluded from BOTH the
+	// digest (so dry-run "would purge" reflects only deletable rows) AND the
+	// candidate set (so they are never re-attempted / re-panicked).
+	preQuarantined, err := loadQuarantine(ctx, db, dbName, "wisps")
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("digest query: %w", err)
+		return 0, 0, 0, nil, fmt.Errorf("load quarantine: %w", err)
 	}
+
+	// Digest: count purgeable closed wisps, EXCLUDING quarantined.
+	// No parent check — closed wisps past the delete age are unconditionally purgeable.
+	digestQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ?%s",
+		notInClause("w.id", len(preQuarantined)))
+	args := append([]interface{}{deleteCutoff}, idArgs(preQuarantined)...)
 	digestTotal := 0
-	for rows.Next() {
-		var wtype string
-		var cnt int
-		if scanErr := rows.Scan(&wtype, &cnt); scanErr != nil {
-			rows.Close()
-			return 0, 0, nil, fmt.Errorf("digest scan: %w", scanErr)
-		}
-		digestTotal += cnt
-	}
-	rows.Close()
-
-	if digestTotal == 0 {
-		return 0, 0, nil, nil
+	if scanErr := db.QueryRowContext(ctx, digestQuery, args...).Scan(&digestTotal); scanErr != nil {
+		return 0, 0, 0, nil, fmt.Errorf("digest query: %w", scanErr)
 	}
 
-	if dryRun {
-		return digestTotal, 0, nil, nil
+	if dryRun || digestTotal == 0 {
+		return digestTotal, len(preQuarantined), 0, nil, nil
 	}
 
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
@@ -628,31 +631,38 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 			"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ?%s LIMIT %d",
 			notInClause("w.id", len(quarantined)), DefaultBatchSize)
 	}
-	return bestEffortPurge(ctx, db, dbName, "wisps", auxTables, true, candidateQuery, deleteCutoff)
+	deleted, newlyQuarantined, anomalies, err = bestEffortPurge(ctx, db, dbName, "wisps", auxTables, true, candidateQuery, deleteCutoff, preQuarantined)
+	return deleted, len(preQuarantined) + newlyQuarantined, newlyQuarantined, anomalies, err
 }
 
-func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (deleted int, quarantined int, err error) {
+func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (deleted, totalQuarantined, newlyQuarantined int, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	mailCutoff := time.Now().UTC().Add(-mailDeleteAge)
 
-	countQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM `%s`.issues WHERE status = 'closed' AND closed_at < ? AND id IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:message')",
-		dbName, dbName)
-	var count int
-	if scanErr := db.QueryRowContext(ctx, countQuery, mailCutoff).Scan(&count); scanErr != nil {
-		if isTableNotFound(scanErr) {
-			return 0, 0, nil // issues/labels not on this server
+	preQuarantined, err := loadQuarantine(ctx, db, dbName, "issues")
+	if err != nil {
+		if isTableNotFound(err) {
+			return 0, 0, 0, nil // issues/labels not on this server
 		}
-		return 0, 0, fmt.Errorf("count mail: %w", scanErr)
-	}
-	if count == 0 {
-		return 0, 0, nil
+		return 0, 0, 0, fmt.Errorf("load quarantine: %w", err)
 	}
 
-	if dryRun {
-		return count, 0, nil
+	countQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM `%s`.issues i WHERE i.status = 'closed' AND i.closed_at < ? AND i.id IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:message')%s",
+		dbName, dbName, notInClause("i.id", len(preQuarantined)))
+	args := append([]interface{}{mailCutoff}, idArgs(preQuarantined)...)
+	var count int
+	if scanErr := db.QueryRowContext(ctx, countQuery, args...).Scan(&count); scanErr != nil {
+		if isTableNotFound(scanErr) {
+			return 0, 0, 0, nil // issues/labels not on this server
+		}
+		return 0, 0, 0, fmt.Errorf("count mail: %w", scanErr)
+	}
+
+	if dryRun || count == 0 {
+		return count, len(preQuarantined), 0, nil
 	}
 
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
@@ -661,8 +671,8 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 			"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message'%s LIMIT %d",
 			dbName, dbName, notInClause("i.id", len(quarantined)), DefaultBatchSize)
 	}
-	deleted, quarantined, _, err = bestEffortPurge(ctx, db, dbName, "issues", auxTables, false, candidateQuery, mailCutoff)
-	return deleted, quarantined, err
+	deleted, newlyQuarantined, _, err = bestEffortPurge(ctx, db, dbName, "issues", auxTables, false, candidateQuery, mailCutoff, preQuarantined)
+	return deleted, len(preQuarantined) + newlyQuarantined, newlyQuarantined, err
 }
 
 // notInClause returns " AND <col> NOT IN (?,?,...)" with n placeholders, or "" if
@@ -673,6 +683,15 @@ func notInClause(col string, n int) string {
 		return ""
 	}
 	return fmt.Sprintf(" AND %s NOT IN (%s)", col, strings.TrimSuffix(strings.Repeat("?,", n), ","))
+}
+
+// idArgs converts a slice of ids into a []interface{} for use as query bind args.
+func idArgs(ids []string) []interface{} {
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
 }
 
 func autoCloseWhereClause(dbName string, splitTarget bool) string {
@@ -838,12 +857,12 @@ const quarantineTable = "_gt_reaper_quarantine"
 // forward progress.
 //
 // reverseDep deletes dangling wisp_dependencies parent refs (wisps only).
-func bestEffortPurge(ctx context.Context, db *sql.DB, dbName, primaryTable string, auxTables []string, reverseDep bool, candidateQuery func(quarantined []string) string, cutoff time.Time) (deleted int, quarantined int, anomalies []Anomaly, err error) {
-	// Load previously-quarantined ids so we never re-attempt (and re-panic on) them.
-	quarantinedIDs, err := loadQuarantine(ctx, db, dbName, primaryTable)
-	if err != nil {
-		return 0, 0, nil, fmt.Errorf("load quarantine: %w", err)
-	}
+//
+// preQuarantined is the set of already-known poison ids (loaded by the caller);
+// it is excluded from every candidate batch so those rows are never re-attempted.
+func bestEffortPurge(ctx context.Context, db *sql.DB, dbName, primaryTable string, auxTables []string, reverseDep bool, candidateQuery func(quarantined []string) string, cutoff time.Time, preQuarantined []string) (deleted int, newlyQuarantinedCount int, anomalies []Anomaly, err error) {
+	// Start from the already-quarantined set; grow it with poison found this run.
+	quarantinedIDs := append([]string(nil), preQuarantined...)
 
 	var newlyQuarantined []string
 	for {

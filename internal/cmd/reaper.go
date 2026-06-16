@@ -334,10 +334,16 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 					prefix = "[DRY RUN] would "
 				}
 				quarantined := r.WispsQuarantined + r.MailQuarantined
+				newlyQuarantined := r.WispsNewlyQuarantined + r.MailNewlyQuarantined
 				fmt.Printf("%s: %spurged %d wisps, %d mail",
 					r.Database, prefix, r.WispsPurged, r.MailPurged)
 				if quarantined > 0 {
-					fmt.Printf(", quarantined %d corrupt (gt-ybj/#11131)", quarantined)
+					// These are corrupt rows whose DELETE panics Dolt (gt-ybj/#11131);
+					// they are skipped (excluded from candidates), not deletable here.
+					fmt.Printf(", %d corrupt quarantined/skipped", quarantined)
+					if newlyQuarantined > 0 {
+						fmt.Printf(" (%d new)", newlyQuarantined)
+					}
 				}
 				fmt.Println()
 				for _, a := range r.Anomalies {
