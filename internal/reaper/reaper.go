@@ -9,7 +9,9 @@ package reaper
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -48,6 +50,79 @@ func isTableNotFound(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "table not found") || strings.Contains(msg, "doesn't exist")
+}
+
+// connRetryAttempts bounds how many times a write transaction is retried when a
+// transient connection-level error is hit. Dolt occasionally tears a connection
+// down mid-write (e.g. the daemon's long-running-query KILL); a fresh connection
+// usually succeeds on the next attempt.
+const connRetryAttempts = 3
+
+// isRetryableConnErr reports whether err is a transient connection-level failure
+// that warrants retrying the operation on a fresh connection.
+//
+// This is the gt-ybj signature: reads/single-statement writes succeed, but the
+// reaper's batch-write transactions fail with "invalid connection" /
+// "packets.go: unexpected EOF" when the underlying connection is recycled or
+// killed mid-transaction.
+func isRetryableConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "invalid connection") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset")
+}
+
+// withConn runs fn against a single dedicated connection checked out from the
+// pool, so that every session-stateful statement in a reaper write transaction
+// (SET @@autocommit, the batch DELETE/UPDATEs, COMMIT, CALL DOLT_COMMIT) runs on
+// the SAME backend connection.
+//
+// gt-ybj root cause: issuing those statements against the pooled *sql.DB
+// directly routed each one to an arbitrary connection. autocommit=0 leaked into
+// pooled connections, the "transaction" was split across multiple backends, and
+// a connection recycled by SetConnMaxLifetime/SetConnMaxIdleTime (or killed by
+// the Dolt daemon) surfaced on reuse as driver.ErrBadConn — the
+// "invalid connection"/EOF failure that hit every database regardless of size.
+//
+// On a transient connection error fn is retried with a fresh connection, so fn
+// MUST be idempotent. The reaper write functions satisfy this: each attempt
+// re-SELECTs its candidate set and persists only via an explicit COMMIT at the
+// end, so a mid-transaction failure rolls back cleanly and the retry starts
+// from a consistent state.
+func withConn(ctx context.Context, db *sql.DB, fn func(conn *sql.Conn) error) error {
+	var lastErr error
+	for attempt := 0; attempt < connRetryAttempts; attempt++ {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			lastErr = fmt.Errorf("acquire connection: %w", err)
+			if isRetryableConnErr(err) {
+				continue
+			}
+			return lastErr
+		}
+
+		err = fn(conn)
+		// Reset session state and return the connection to the pool. A bad
+		// connection is discarded by Close(); a healthy one is recycled clean.
+		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
+		_ = conn.Close()
+
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableConnErr(err) {
+			return err
+		}
+	}
+	return lastErr
 }
 
 func scanStaleCandidatesQuery(splitTarget bool) string {
@@ -403,84 +478,90 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
-	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
-
 	// Batch UPDATE: select IDs in chunks, update each chunk.
 	// This avoids holding a write lock on the entire table for minutes.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
+	// All statements run on one pinned connection so the autocommit=0 transaction
+	// stays coherent on a single backend (gt-ybj).
 	totalReaped := 0
-	for {
-		var rows *sql.Rows
-		err := retryDependencyTargetQuery(func(splitTarget bool) error {
-			var queryErr error
-			rows, queryErr = db.QueryContext(ctx, reapIDsQuery(splitTarget), cutoff)
-			return queryErr
-		})
-		if err != nil {
-			return nil, fmt.Errorf("select reap batch: %w", err)
+	if err := withConn(ctx, db, func(conn *sql.Conn) error {
+		totalReaped = 0
+
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
 		}
 
-		var ids []string
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("scan wisp id: %w", err)
+		for {
+			var rows *sql.Rows
+			err := retryDependencyTargetQuery(func(splitTarget bool) error {
+				var queryErr error
+				rows, queryErr = conn.QueryContext(ctx, reapIDsQuery(splitTarget), cutoff)
+				return queryErr
+			})
+			if err != nil {
+				return fmt.Errorf("select reap batch: %w", err)
 			}
-			ids = append(ids, id)
-		}
-		rows.Close()
 
-		if len(ids) == 0 {
-			break
+			var ids []string
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return fmt.Errorf("scan wisp id: %w", err)
+				}
+				ids = append(ids, id)
+			}
+			rows.Close()
+
+			if len(ids) == 0 {
+				break
+			}
+
+			placeholders := make([]string, len(ids))
+			args := make([]interface{}, len(ids))
+			for i, id := range ids {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+			inClause := strings.Join(placeholders, ",")
+
+			updateQuery := fmt.Sprintf(
+				"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s)",
+				inClause)
+			sqlResult, err := conn.ExecContext(ctx, updateQuery, args...)
+			if err != nil {
+				return fmt.Errorf("close stale wisps batch: %w", err)
+			}
+
+			affected, _ := sqlResult.RowsAffected()
+			totalReaped += int(affected)
 		}
 
-		placeholders := make([]string, len(ids))
-		args := make([]interface{}, len(ids))
-		for i, id := range ids {
-			placeholders[i] = "?"
-			args[i] = id
+		if totalReaped > 0 {
+			// Flush the SQL transaction to the Dolt working set before DOLT_COMMIT.
+			// With autocommit=0, UPDATE changes are in the SQL transaction buffer,
+			// not the Dolt working set. DOLT_COMMIT operates on the working set,
+			// so without this COMMIT it sees "nothing to commit".
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return fmt.Errorf("sql commit: %w", err)
+			}
+			commitMsg := fmt.Sprintf("reaper: close %d stale wisps in %s", totalReaped, dbName)
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+				// "nothing to commit" is expected when the reaper reverts dirty working
+				// set changes back to match HEAD. The wisps were set to "open" in the
+				// server's in-memory working set without being committed; closing them
+				// makes the working set match HEAD again, so DOLT_COMMIT sees no diff.
+				if !isNothingToCommit(err) {
+					return fmt.Errorf("dolt commit: %w", err)
+				}
+			}
 		}
-		inClause := strings.Join(placeholders, ",")
-
-		updateQuery := fmt.Sprintf(
-			"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s)",
-			inClause)
-		sqlResult, err := db.ExecContext(ctx, updateQuery, args...)
-		if err != nil {
-			return nil, fmt.Errorf("close stale wisps batch: %w", err)
-		}
-
-		affected, _ := sqlResult.RowsAffected()
-		totalReaped += int(affected)
+		return nil
+	}); err != nil {
+		return result, err
 	}
 
 	result.Reaped = totalReaped
-
-	if totalReaped > 0 {
-		// Flush the SQL transaction to the Dolt working set before DOLT_COMMIT.
-		// With autocommit=0, UPDATE changes are in the SQL transaction buffer,
-		// not the Dolt working set. DOLT_COMMIT operates on the working set,
-		// so without this COMMIT it sees "nothing to commit".
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-			return result, fmt.Errorf("sql commit: %w", err)
-		}
-		commitMsg := fmt.Sprintf("reaper: close %d stale wisps in %s", totalReaped, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// "nothing to commit" is expected when the reaper reverts dirty working
-			// set changes back to match HEAD. The wisps were set to "open" in the
-			// server's in-memory working set without being committed; closing them
-			// makes the working set match HEAD again, so DOLT_COMMIT sees no diff.
-			if !isNothingToCommit(err) {
-				return result, fmt.Errorf("dolt commit: %w", err)
-			}
-		}
-	}
 
 	openQuery := "SELECT COUNT(*) FROM wisps WHERE status IN ('open', 'hooked', 'in_progress')"
 	if err := db.QueryRowContext(ctx, openQuery).Scan(&result.OpenRemain); err != nil {
@@ -548,41 +629,48 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		return digestTotal, anomalies, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return 0, nil, fmt.Errorf("disable autocommit: %w", err)
-	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
-
 	// Batch delete — simple status+age filter, no parent check needed for purge.
 	idQuery := fmt.Sprintf(
 		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
 		DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables)
+	// All statements run on one pinned connection so the autocommit=0 transaction
+	// stays coherent (gt-ybj). The closure is re-run on a transient connection
+	// error, so reset the per-attempt outputs at the top.
+	totalDeleted := 0
+	err = withConn(ctx, db, func(conn *sql.Conn) error {
+		totalDeleted = 0
+		anomalies = nil
+
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
+		}
+
+		deleted, err := batchDeleteRows(ctx, conn, idQuery, deleteCutoff, "wisps", auxTables)
+		if err != nil {
+			return err
+		}
+		totalDeleted = deleted
+
+		if totalDeleted > 0 {
+			// Flush SQL transaction to working set before DOLT_COMMIT.
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return fmt.Errorf("sql commit: %w", err)
+			}
+			commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+				// Non-fatal — log but continue.
+				anomalies = append(anomalies, Anomaly{
+					Type:    "dolt_commit_failed",
+					Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
+				})
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return totalDeleted, anomalies, err
-	}
-
-	if totalDeleted > 0 {
-		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-			anomalies = append(anomalies, Anomaly{
-				Type:    "sql_commit_failed",
-				Message: fmt.Sprintf("sql commit after purge failed: %v", err),
-			})
-			return totalDeleted, anomalies, nil
-		}
-		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// Non-fatal — log but continue.
-			anomalies = append(anomalies, Anomaly{
-				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
-			})
-		}
 	}
 
 	return totalDeleted, anomalies, nil
@@ -612,32 +700,40 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 		return count, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return 0, fmt.Errorf("disable autocommit: %w", err)
-	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
-
 	idQuery := fmt.Sprintf(
 		"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message' LIMIT %d",
 		dbName, dbName, DefaultBatchSize)
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, mailCutoff, "issues", auxTables)
+	// One pinned connection for the whole autocommit=0 transaction (gt-ybj).
+	totalDeleted := 0
+	err := withConn(ctx, db, func(conn *sql.Conn) error {
+		totalDeleted = 0
+
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
+		}
+
+		deleted, err := batchDeleteRows(ctx, conn, idQuery, mailCutoff, "issues", auxTables)
+		if err != nil {
+			return err
+		}
+		totalDeleted = deleted
+
+		if totalDeleted > 0 {
+			// Flush SQL transaction to working set before DOLT_COMMIT.
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return fmt.Errorf("sql commit: %w", err)
+			}
+			commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+				// Non-fatal.
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return totalDeleted, err
-	}
-
-	if totalDeleted > 0 {
-		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-			return totalDeleted, fmt.Errorf("sql commit: %w", err)
-		}
-		commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// Non-fatal.
-		}
 	}
 
 	return totalDeleted, nil
@@ -737,13 +833,6 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
-	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
-
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
 	for i, id := range ids {
@@ -753,23 +842,29 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	updateQuery := fmt.Sprintf(
 		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW(), close_reason = 'stale:auto-closed by reaper' WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
-		return nil, fmt.Errorf("auto-close: %w", err)
-	}
 
-	result.Closed = len(ids)
+	// One pinned connection for the whole autocommit=0 transaction (gt-ybj).
+	if err := withConn(ctx, db, func(conn *sql.Conn) error {
+		result.Anomalies = nil
 
-	if len(ids) > 0 {
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
+		}
+
+		if _, err := conn.ExecContext(ctx, updateQuery, args...); err != nil {
+			return fmt.Errorf("auto-close: %w", err)
+		}
+
 		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 			result.Anomalies = append(result.Anomalies, Anomaly{
 				Type:    "sql_commit_failed",
 				Message: fmt.Sprintf("sql commit after auto-close failed: %v", err),
 			})
-			return result, nil
+			return nil
 		}
 		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// "nothing to commit" is expected when the updated tables are dolt_ignored.
 			if !isNothingToCommit(err) {
 				result.Anomalies = append(result.Anomalies, Anomaly{
@@ -778,16 +873,25 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 				})
 			}
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+
+	result.Closed = len(ids)
 
 	return result, nil
 }
 
-// batchDeleteRows deletes rows from a primary table and its auxiliary tables in batches.
-func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
+// batchDeleteRows deletes rows from a primary table and its auxiliary tables in
+// batches. It runs every statement on the supplied pinned connection so the
+// surrounding autocommit=0 transaction stays coherent on a single backend (see
+// withConn / gt-ybj). Each batch is committed to the SQL transaction working set
+// by the caller's final COMMIT.
+func batchDeleteRows(ctx context.Context, conn *sql.Conn, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
 	totalDeleted := 0
 	for {
-		idRows, err := db.QueryContext(ctx, idQuery, cutoffArg)
+		idRows, err := conn.QueryContext(ctx, idQuery, cutoffArg)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("select batch: %w", err)
 		}
@@ -817,21 +921,21 @@ func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg 
 
 		for _, tbl := range auxTables {
 			delAux := fmt.Sprintf("DELETE FROM `%s` WHERE issue_id IN %s", tbl, inClause) //nolint:gosec // G201: tbl is internal
-			if _, err := db.ExecContext(ctx, delAux, args...); err != nil {
+			if _, err := conn.ExecContext(ctx, delAux, args...); err != nil {
 				// Non-fatal: log and continue.
 			}
 		}
 
 		// Clean up reverse dependency references to prevent dangling parent refs.
 		if err := retryDependencyTargetQuery(func(splitTarget bool) error {
-			_, execErr := db.ExecContext(ctx, reverseWispDependencyDeleteQuery(inClause, splitTarget), args...)
+			_, execErr := conn.ExecContext(ctx, reverseWispDependencyDeleteQuery(inClause, splitTarget), args...)
 			return execErr
 		}); err != nil {
 			// Non-fatal.
 		}
 
 		delPrimary := fmt.Sprintf("DELETE FROM `%s` WHERE id IN %s", primaryTable, inClause) //nolint:gosec // G201: primaryTable is internal
-		sqlResult, err := db.ExecContext(ctx, delPrimary, args...)
+		sqlResult, err := conn.ExecContext(ctx, delPrimary, args...)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("delete %s batch: %w", primaryTable, err)
 		}
@@ -893,13 +997,6 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
-	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
-
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
 	for i, id := range ids {
@@ -909,26 +1006,39 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 	updateQuery := fmt.Sprintf(
 		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
-		return nil, fmt.Errorf("close plugin receipts: %w", err)
-	}
 
-	// Flush and commit.
-	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin receipt close failed: %v", err),
-		})
-		return result, nil
-	}
-	commitMsg := fmt.Sprintf("reaper: close %d plugin receipts in %s", len(ids), dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-		if !isNothingToCommit(err) {
-			result.Anomalies = append(result.Anomalies, Anomaly{
-				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after plugin receipt close failed: %v", err),
-			})
+	// One pinned connection for the whole autocommit=0 transaction (gt-ybj).
+	if err := withConn(ctx, db, func(conn *sql.Conn) error {
+		result.Anomalies = nil
+
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
 		}
+
+		if _, err := conn.ExecContext(ctx, updateQuery, args...); err != nil {
+			return fmt.Errorf("close plugin receipts: %w", err)
+		}
+
+		// Flush and commit.
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "sql_commit_failed",
+				Message: fmt.Sprintf("sql commit after plugin receipt close failed: %v", err),
+			})
+			return nil
+		}
+		commitMsg := fmt.Sprintf("reaper: close %d plugin receipts in %s", len(ids), dbName)
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+			if !isNothingToCommit(err) {
+				result.Anomalies = append(result.Anomalies, Anomaly{
+					Type:    "dolt_commit_failed",
+					Message: fmt.Sprintf("dolt commit after plugin receipt close failed: %v", err),
+				})
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	return result, nil
@@ -981,13 +1091,6 @@ func ClosePluginDispatches(db *sql.DB, dbName string, maxAge time.Duration, dryR
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
-		return nil, fmt.Errorf("disable autocommit: %w", err)
-	}
-	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
-
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids))
 	for i, id := range ids {
@@ -997,26 +1100,39 @@ func ClosePluginDispatches(db *sql.DB, dbName string, maxAge time.Duration, dryR
 	updateQuery := fmt.Sprintf(
 		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
 		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
-		return nil, fmt.Errorf("close plugin dispatches: %w", err)
-	}
 
-	// Flush and commit.
-	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin dispatch close failed: %v", err),
-		})
-		return result, nil
-	}
-	commitMsg := fmt.Sprintf("reaper: close %d plugin dispatches in %s", len(ids), dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-		if !isNothingToCommit(err) {
-			result.Anomalies = append(result.Anomalies, Anomaly{
-				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after plugin dispatch close failed: %v", err),
-			})
+	// One pinned connection for the whole autocommit=0 transaction (gt-ybj).
+	if err := withConn(ctx, db, func(conn *sql.Conn) error {
+		result.Anomalies = nil
+
+		if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+			return fmt.Errorf("disable autocommit: %w", err)
 		}
+
+		if _, err := conn.ExecContext(ctx, updateQuery, args...); err != nil {
+			return fmt.Errorf("close plugin dispatches: %w", err)
+		}
+
+		// Flush and commit.
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "sql_commit_failed",
+				Message: fmt.Sprintf("sql commit after plugin dispatch close failed: %v", err),
+			})
+			return nil
+		}
+		commitMsg := fmt.Sprintf("reaper: close %d plugin dispatches in %s", len(ids), dbName)
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+			if !isNothingToCommit(err) {
+				result.Anomalies = append(result.Anomalies, Anomaly{
+					Type:    "dolt_commit_failed",
+					Message: fmt.Sprintf("dolt commit after plugin dispatch close failed: %v", err),
+				})
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	return result, nil

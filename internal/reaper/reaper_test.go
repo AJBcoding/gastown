@@ -1,6 +1,7 @@
 package reaper
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"strings"
 	"testing"
@@ -228,6 +229,46 @@ func TestIsNothingToCommit(t *testing.T) {
 		if got != c.want {
 			t.Errorf("isNothingToCommit(%q) = %v, want %v", c.msg, got, c.want)
 		}
+	}
+}
+
+func TestIsRetryableConnErr(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		// gt-ybj signatures: the reaper's batch-write path tears down the
+		// connection with these errors while reads stay healthy.
+		{"invalid connection", true},
+		{"Error 1105: invalid connection", true},
+		{"packets.go:58 unexpected EOF", true},
+		{"unexpected EOF", true},
+		{"write: broken pipe", true},
+		{"read: connection reset by peer", true},
+		{"INVALID CONNECTION", true}, // case-insensitive
+		// Non-transient errors must not be retried.
+		{"nothing to commit", false},
+		{"table not found: wisps", false},
+		{"syntax error near 'DELETE'", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		var err error
+		if c.msg != "" {
+			err = fmt.Errorf("%s", c.msg)
+		}
+		if got := isRetryableConnErr(err); got != c.want {
+			t.Errorf("isRetryableConnErr(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+
+	// driver.ErrBadConn (and anything wrapping it) is always retryable, even
+	// though its message text does not match the substrings above.
+	if !isRetryableConnErr(driver.ErrBadConn) {
+		t.Error("isRetryableConnErr(driver.ErrBadConn) = false, want true")
+	}
+	if !isRetryableConnErr(fmt.Errorf("delete wisps batch: %w", driver.ErrBadConn)) {
+		t.Error("isRetryableConnErr(wrapped driver.ErrBadConn) = false, want true")
 	}
 }
 
