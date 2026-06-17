@@ -149,10 +149,12 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
 
   cd "$BACKUP_REPO"
 
-  if git diff --quiet && git diff --staged --quiet; then
+  # Stage first so newly-added (untracked) JSONL snapshots are detected;
+  # `git diff` alone misses untracked files and would skip the commit.
+  git add -A 2>/dev/null || true
+  if git diff --staged --quiet; then
     log "No changes to commit"
   else
-    git add *.jsonl 2>/dev/null || true
     git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
       --author="Gas Town Archive <archive@gastown.local>" 2>/dev/null || true
 
@@ -180,25 +182,25 @@ if ! $SKIP_DOLT_PUSH; then
   log ""
   log "=== Dolt Push ==="
 
+  # GNU `timeout` is absent on stock macOS; use it only if available.
+  if command -v timeout >/dev/null 2>&1; then DPUSH_TIMEOUT="timeout 300"
+  elif command -v gtimeout >/dev/null 2>&1; then DPUSH_TIMEOUT="gtimeout 300"
+  else DPUSH_TIMEOUT=""; fi
+
   for DB in "${PROD_DBS[@]}"; do
-    DB_DIR="$DOLT_DATA_DIR/$DB"
-
-    if [[ ! -d "$DB_DIR/.dolt" ]]; then
-      log "  $DB: no .dolt directory, skipping"
-      continue
-    fi
-
-    REMOTES=$(cd "$DB_DIR" && { dolt remote -v 2>/dev/null | grep -v "^$" | head -5 || true; })
+    # Push via the running sql-server. Embedded `dolt push` (cd into the data dir)
+    # conflicts with the server's lock on that dir and fails; route the remote
+    # lookup and push through the server via dolt_query / CALL DOLT_PUSH.
+    REMOTES=$(dolt_query "$DB" "SELECT name FROM dolt_remotes")
     if [[ -z "$REMOTES" ]]; then
       log "  $DB: no remotes configured, skipping"
       continue
     fi
 
     log "  $DB: pushing to remotes..."
-    cd "$DB_DIR"
 
-    for REMOTE_NAME in $(dolt remote -v 2>/dev/null | awk '{print $1}' | sort -u || true); do
-      if timeout 120 dolt push "$REMOTE_NAME" main 2>/dev/null; then
+    for REMOTE_NAME in $REMOTES; do
+      if $DPUSH_TIMEOUT dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --no-tls -u "$DOLT_USER" -p "" --use-db "$DB" sql -q "CALL DOLT_PUSH('$REMOTE_NAME','main')" >/dev/null 2>>"$LOGFILE"; then
         log "    $REMOTE_NAME: pushed"
         DOLT_PUSHED=$((DOLT_PUSHED + 1))
       else
