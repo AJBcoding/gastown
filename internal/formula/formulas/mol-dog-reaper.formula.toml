@@ -22,7 +22,7 @@ This is infrastructure cleanup work:
 | purge_age | config | Max closed wisp age before purging (default 7d) |
 | stale_issue_age | config | Max issue staleness before auto-close (default 30d) |
 | mail_delete_age | config | Max closed mail age before purging (default 7d) |
-| alert_threshold | config | Open wisp count that triggers escalation (default 500) |
+| alert_threshold | config | Open wisp count above which a sustained climb may warrant escalation (default 3500) |
 | dry_run | config | If "true", report without acting |
 | databases | config | Comma-separated DB list (default: auto-discover) |
 | dolt_port | config | Dolt server port (default 3307) |
@@ -39,13 +39,19 @@ issues that are not P0/P1, not epics, and have no active dependencies.
 The Dog should watch for and flag:
 - Dangling parent references (wisps referencing purged parents)
 - Sudden spikes in reap candidates (suggests a wisp lifecycle problem)
-- Open wisp counts exceeding alert_threshold
+- Open wisp count exceeding alert_threshold **and still climbing after 24h+**
+  (a sustained leak — a count at steady-state above the threshold is the
+  expected structural baseline, NOT an anomaly; see the reap-step policy)
 - Dolt commit failures (data may not be persisted)
 
 NOT anomalies (do NOT escalate these):
 - Scan/reap count mismatch (scan finds N, reap closes M < N): this is a benign
   race condition — the witness closes wisps for dead sessions concurrently.
-  This is expected behavior, not a bug."""
+  This is expected behavior, not a bug.
+- Open wisp count above alert_threshold at steady-state: dog patrols hold a
+  structural baseline of open step-wisps within their TTL (gt-fdt). Only a
+  sustained 24h+ climb is an anomaly. Always escalate with a stable
+  `--fingerprint` so repeats are suppressed."""
 formula = "mol-dog-reaper"
 version = 2
 
@@ -79,7 +85,11 @@ gt reaper scan --db=<name> --port={{dolt_port}} \\
 - Check the `anomalies` array in the JSON output
 - Flag any `dangling_parent_ref` anomalies — these indicate wisps with
   parent dependency records pointing to purged/missing parents
-- If `open_wisps` exceeds {{alert_threshold}}, escalate
+- If `open_wisps` exceeds {{alert_threshold}}, this MAY warrant escalation —
+  but see the escalation policy in the "reap" step before doing so. A count
+  above the threshold is NOT by itself an anomaly: dog patrols hold a structural
+  baseline of open step-wisps within their TTL. Only escalate per the policy
+  below, and always with a stable `--fingerprint` so repeats are suppressed.
 
 **4. Decide whether to proceed:**
 - If no candidates found across all databases, skip remaining steps
@@ -107,9 +117,33 @@ gt reaper reap --db=<name> --port={{dolt_port}} \\
 - Only escalate if reap returns an actual error (not a zero count).
 - Check for any anomalies in the response
 
-**3. Alert check:**
-If total open wisps across all databases exceed {{alert_threshold}},
-log a warning and consider escalating.
+**3. Alert check (escalation policy — per 2026-05-31 policy, gt-fdt):**
+
+Open wisp count exceeding {{alert_threshold}} is NOT on its own grounds to
+escalate. Dog patrols decompose into step-wisps that linger status=open within
+their TTL, so a count near or above the threshold is the expected structural
+baseline, not an anomaly. Escalating on it every cycle produced chronic
+duplicate escalations (gt-fdt).
+
+ONLY escalate when one of these is true:
+- The open count exceeds {{alert_threshold}} **and is still climbing after 24h+**
+  (a sustained leak, not a transient spike or steady-state baseline).
+- `gt reaper scan` or `reap` returned an actual **error** (not a zero/low count).
+- A specific **leak is identified** (e.g. a molecule that never closes its steps,
+  dangling_parent_ref anomalies that persist across cycles).
+
+When you do escalate, ALWAYS pass a stable `--fingerprint` so repeated cycles
+suppress duplicates while the alert remains open:
+```bash
+gt escalate "Open wisp count climbing past threshold ({{alert_threshold}})" \\
+  -s MEDIUM --source patrol:reaper \\
+  --fingerprint reaper:open-wisp-threshold \\
+  -m "<count, 24h+ trend, suspected leak>"
+```
+The escalation is auto-suppressed if an open escalation with the same fingerprint
+already exists, so this is safe to run every cycle.
+
+Otherwise, just log the count for the report and move on. Do NOT escalate.
 
 **Exit criteria:** All stale wisps closed (or dry-run counts reported)."""
 
@@ -180,10 +214,15 @@ Generate summary and signal completion.
 **Anomalies**: (list any anomalies found)
 ```
 
-**2. If anomalies were found, escalate:**
+**2. If anomalies were found, escalate (with a stable fingerprint for dedup):**
 ```bash
-gt escalate "Reaper anomalies detected" -s MEDIUM -m "<anomaly details>"
+gt escalate "Reaper anomalies detected" -s MEDIUM --source patrol:reaper \\
+  --fingerprint reaper:anomaly -m "<anomaly details>"
 ```
+The `--fingerprint` suppresses duplicate escalations while a prior one is still
+open, so repeated patrol cycles don't spam the Mayor. A bare open-wisp count
+above {{alert_threshold}} is NOT an anomaly — see the reap step's escalation
+policy.
 
 **Exit criteria:** Report generated, anomalies escalated if any."""
 
@@ -205,8 +244,8 @@ description = "Max closed mail age before purging (e.g., '168h' = 7 days)"
 default = "168h"
 
 [vars.alert_threshold]
-description = "Open wisp count that triggers escalation warning"
-default = "800"
+description = "Open wisp count above which a sustained climb may warrant escalation (see reap-step policy)"
+default = "3500"
 
 [vars.dry_run]
 description = "If 'true', report without modifying data"

@@ -263,10 +263,13 @@ const (
 	// DefaultAlertThreshold is the open-wisp count above which callers should
 	// surface a warning. Original sizing (800) assumed ~23 wisps/h × 24h TTL
 	// ≈ 550 baseline, but observed HQ patrol velocity is ~40 wisps/h, putting
-	// natural steady-state at ~960 — well above 800. Raised to 2000 to give
-	// headroom and stop spurious daily alerts; real fix is per-database
-	// or growth-rate-based sizing per hq-o82zr.
-	DefaultAlertThreshold = 2000
+	// natural steady-state at ~960 — well above 800. Raised to 2000, then to
+	// 3500 (gt-fdt) after dog-patrol step-wisps were found to hold a structural
+	// baseline of ~2100 open wisps within their 24h TTL — above the old 2000
+	// ceiling, so dogs escalated EVERY patrol cycle. 3500 gives headroom above
+	// the structural baseline; the real fix is per-database or growth-rate-based
+	// sizing per hq-o82zr.
+	DefaultAlertThreshold = 3500
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
