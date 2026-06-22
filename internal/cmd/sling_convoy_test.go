@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -190,6 +191,62 @@ esac
 	}
 	if len(ids) != 1 || ids[0] != "gt-abc123" {
 		t.Fatalf("ids = %v, want [gt-abc123]", ids)
+	}
+}
+
+// TestBdDepListRawIDsCachesSplitTargetSchema verifies that once bdDepListRawIDs
+// detects the split target-column schema for a directory, subsequent calls skip
+// the legacy depends_on_id probe instead of re-running (and re-erroring on) it
+// every time. The legacy probe must fire at most once — it floods hq Dolt logs
+// on the convoy patrol hot path otherwise (gt-0e0).
+func TestBdDepListRawIDsCachesSplitTargetSchema(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	binDir := t.TempDir()
+	beadsDir := t.TempDir()
+	legacyProbeLog := filepath.Join(binDir, "legacy-probes")
+
+	bdScript := `#!/bin/sh
+case "$*" in
+  *"SELECT depends_on_id FROM dependencies"*)
+    echo x >> "` + legacyProbeLog + `"
+    echo '{"error":"query error: Error 1105 (HY000): column \"depends_on_id\" could not be found in any table in scope","schema_version":1}'
+    exit 1
+    ;;
+  *"COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id"*)
+    echo '[{"depends_on_id":"external:gt:gt-abc123"}]'
+    exit 0
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 1
+    ;;
+esac
+`
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	for i := 0; i < 3; i++ {
+		ids, err := bdDepListRawIDs(beadsDir, "hq-cv-test", "down", "tracks")
+		if err != nil {
+			t.Fatalf("call %d: bdDepListRawIDs: %v", i, err)
+		}
+		if len(ids) != 1 || ids[0] != "gt-abc123" {
+			t.Fatalf("call %d: ids = %v, want [gt-abc123]", i, ids)
+		}
+	}
+
+	probes, err := os.ReadFile(legacyProbeLog)
+	if err != nil {
+		t.Fatalf("read legacy probe log: %v", err)
+	}
+	if got := strings.Count(string(probes), "x"); got != 1 {
+		t.Fatalf("legacy depends_on_id probe fired %d times across 3 calls, want exactly 1", got)
 	}
 }
 
