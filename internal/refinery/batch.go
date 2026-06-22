@@ -318,24 +318,14 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 	return result
 }
 
-// runBatchGates runs quality gates (or legacy tests) on the current working tree.
+// runBatchGates runs quality gates (or legacy tests) on the current working
+// tree, which is the squash-merge stack tip (the merge result) when called from
+// the batch pipeline. gt-ceo: it validates the full gate suite — both pre-merge
+// and post-squash phases — so post-squash gates (e.g. build/typecheck) are run
+// on the combined batch result, not silently skipped as they were when this
+// only ran the pre-merge phase.
 func (e *Engineer) runBatchGates(ctx context.Context) ProcessResult {
-	if len(e.config.Gates) > 0 {
-		return e.runGates(ctx)
-	}
-	if e.config.RunTests && e.config.TestCommand != "" {
-		result := e.runTests(ctx)
-		if !result.Success {
-			return ProcessResult{
-				Success:     false,
-				TestsFailed: true,
-				Error:       result.Error,
-			}
-		}
-		return ProcessResult{Success: true}
-	}
-	// No gates configured — pass by default
-	return ProcessResult{Success: true}
+	return e.validateMergeResult(ctx)
 }
 
 // verifyAndPush runs gates and pushes the current state for a set of stacked MRs.

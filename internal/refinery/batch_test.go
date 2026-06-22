@@ -789,6 +789,90 @@ func TestProcessBatch_BisectAndMergeGood(t *testing.T) {
 	}
 }
 
+// --- merge-result validation tests (gt-ceo) ---
+
+// TestProcessBatch_SingleMR_GateValidatesMergeResult is the regression test for
+// gt-ceo defect 2: a single MR whose squash-merged result fails a quality gate
+// must NOT land on main, even when the gate's phase is the default (pre-merge).
+//
+// Before the fix, single-MR merges ran pre-merge gates on the bare target
+// (which is already green) and only ran explicitly-tagged post-squash gates on
+// the merge result. A default-phase gate therefore never saw the merged tree,
+// so a broken merge result could be pushed to main. This test fails against the
+// old behavior (the MR would land) and passes once gates validate the merge
+// result.
+func TestProcessBatch_SingleMR_GateValidatesMergeResult(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+
+	// The branch introduces FAIL_MARKER. The gate (default pre-merge phase)
+	// passes on the bare target but must fail on the merge result.
+	createFeatureBranch(t, workDir, "feature-bad", "FAIL_MARKER", "breaks the build\n")
+
+	e := newTestEngineer(t, workDir, g)
+	e.config.Gates = map[string]*GateConfig{
+		"check": {Cmd: failMarkerGateCmd()}, // no Phase → defaults to pre-merge
+	}
+	e.config.GatesParallel = false
+
+	batch := []*MRInfo{makeMR("mr-bad", "feature-bad", "main")}
+
+	result := e.ProcessBatch(context.Background(), batch, "main", DefaultBatchConfig())
+	if result.Error != nil {
+		t.Fatalf("unexpected error: %v", result.Error)
+	}
+	if len(result.Merged) != 0 {
+		t.Errorf("broken merge result must not land: expected 0 merged, got %d: %v", len(result.Merged), stackedIDs(result.Merged))
+	}
+	if len(result.Culprits) != 1 || result.Culprits[0].ID != "mr-bad" {
+		t.Errorf("expected culprits=[mr-bad], got %v", stackedIDs(result.Culprits))
+	}
+
+	// The broken tree must not have been pushed to origin.
+	verifyDir := filepath.Join(filepath.Dir(workDir), "verify-gtceo")
+	bareDir := filepath.Join(filepath.Dir(workDir), "origin.git")
+	run(t, filepath.Dir(workDir), "git", "clone", bareDir, verifyDir)
+	if _, err := os.Stat(filepath.Join(verifyDir, "FAIL_MARKER")); !os.IsNotExist(err) {
+		t.Error("FAIL_MARKER must NOT be present in origin after a failed merge-result gate")
+	}
+}
+
+// TestRunBatchGates_RunsPostSquashGates verifies that the batch path validates
+// post-squash-phase gates on the stack tip. Before gt-ceo, runBatchGates only
+// ran the pre-merge phase, so post-squash gates (e.g. build/typecheck) were
+// silently skipped on the combined batch result.
+func TestProcessBatch_PostSquashGateValidatesResult(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+
+	createFeatureBranch(t, workDir, "feature-a", "a.txt", "hello a\n")
+	createFeatureBranch(t, workDir, "feature-b", "POST_FAIL", "breaks the build\n")
+
+	e := newTestEngineer(t, workDir, g)
+	// A post-squash gate that fails when POST_FAIL exists in the merged tree.
+	e.config.Gates = map[string]*GateConfig{
+		"build": {Cmd: "test ! -f POST_FAIL", Phase: GatePhasePostSquash},
+	}
+	e.config.GatesParallel = false
+
+	batch := []*MRInfo{
+		makeMR("mr-a", "feature-a", "main"),
+		makeMR("mr-b", "feature-b", "main"),
+	}
+	cfg := &BatchConfig{MaxBatchSize: 5, RetryBatchOnFlaky: false}
+
+	result := e.ProcessBatch(context.Background(), batch, "main", cfg)
+	if result.Error != nil {
+		t.Fatalf("unexpected error: %v", result.Error)
+	}
+	if len(result.Merged) != 1 || result.Merged[0].ID != "mr-a" {
+		t.Errorf("expected merged=[mr-a], got %v", stackedIDs(result.Merged))
+	}
+	if len(result.Culprits) != 1 || result.Culprits[0].ID != "mr-b" {
+		t.Errorf("post-squash gate must catch mr-b: expected culprits=[mr-b], got %v", stackedIDs(result.Culprits))
+	}
+}
+
 // --- getMergeMessage tests ---
 
 func TestGetMergeMessage_FromBranch(t *testing.T) {

@@ -594,27 +594,22 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// Step 4: Run quality gates (or legacy tests) if configured.
 	// Phase 3 fast-path: if skipGates is true (pre-verified MR with matching base),
 	// skip all gate execution — the polecat already ran gates after rebasing.
+	//
+	// gt-ceo: For the local squash path, gates now validate the MERGE RESULT
+	// (Step 5.5) rather than the bare target. Running gates on the unmerged
+	// target before the squash was useless — the target is already green — and
+	// it let a squash merge that produced a broken tree (dropped edits or type
+	// errors from concurrent changes) land on main without ever type-checking
+	// the combined result. The PR strategy is the exception: it hands the merge
+	// to the VCS provider (remote merge), so there is no local merge result to
+	// gate afterward; validate the branch-vs-target state now instead.
 	shouldSkipGates := len(skipGates) > 0 && skipGates[0]
 	if shouldSkipGates {
 		_, _ = fmt.Fprintln(e.output, "[Engineer] Skipping gates (pre-verified by polecat)")
-	} else if len(e.config.Gates) > 0 {
-		// New gates system: run configured quality gates
-		gateResult := e.runGates(ctx)
-		if !gateResult.Success {
+	} else if e.config.MergeStrategy == "pr" {
+		if gateResult := e.validateMergeResult(ctx); !gateResult.Success {
 			return gateResult
 		}
-	} else if e.config.RunTests && e.config.TestCommand != "" {
-		// Legacy test command path (backward compatible)
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Running tests: %s\n", e.config.TestCommand)
-		result := e.runTests(ctx)
-		if !result.Success {
-			return ProcessResult{
-				Success:     false,
-				TestsFailed: true,
-				Error:       result.Error,
-			}
-		}
-		_, _ = fmt.Fprintln(e.output, "[Engineer] Tests passed")
 	}
 
 	// PR merge path: when merge_strategy=pr, use the VCS provider's merge API
@@ -658,16 +653,21 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 		}
 	}
 
-	// Step 5.5: Run post-squash gates on the merged result.
-	// These validate the actual combined code before it goes anywhere.
-	// On failure, reset the merge to undo the local squash commit.
+	// Step 5.5: Validate the MERGE RESULT with the full gate suite before push.
+	// gt-ceo: This runs the configured gates (both pre-merge and post-squash
+	// phases, or the legacy test command) against the actual squash-merged tree
+	// — not the pre-merge target. A squash merge that silently drops a polecat's
+	// edits/deletions or produces type errors from concurrent changes will fail
+	// here and be reset instead of landing red on main. On failure we reset the
+	// merge to undo the local squash commit and surface a loud failure (the MR
+	// is reopened / assigned back via the TestsFailed path).
 	if !shouldSkipGates {
-		postResult := e.runGatesForPhase(ctx, GatePhasePostSquash)
-		if !postResult.Success {
+		mergeResult := e.validateMergeResult(ctx)
+		if !mergeResult.Success {
 			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after post-squash gate failure: %v\n", target, resetErr)
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after merge-result gate failure: %v\n", target, resetErr)
 			}
-			return postResult
+			return mergeResult
 		}
 	}
 
@@ -1096,6 +1096,42 @@ func (e *Engineer) runGatesForPhase(ctx context.Context, phase GatePhase) Proces
 	}
 
 	_, _ = fmt.Fprintln(e.output, "[Engineer] All quality gates passed")
+	return ProcessResult{Success: true}
+}
+
+// validateMergeResult runs the full quality gate suite against the current
+// working tree, which the caller must have positioned at the merge result
+// (i.e. after the squash merge / stack build). It runs both pre-merge and
+// post-squash gate phases, or the legacy test command when no gates are
+// configured.
+//
+// gt-ceo: The merge result — not just the polecat branch or the pre-merge
+// target — must be re-validated before pushing. Git's 3-way squash merge can
+// auto-resolve concurrent edits into a tree that type-checks differently from
+// either side (e.g. a rename on one side + edits to the renamed symbol on the
+// other, leaving orphaned/unwired code). Type-checking the combined tree here
+// is the only thing that catches that before it lands on main.
+func (e *Engineer) validateMergeResult(ctx context.Context) ProcessResult {
+	if len(e.config.Gates) > 0 {
+		// New gates system: validate with the full suite across both phases.
+		if preResult := e.runGatesForPhase(ctx, GatePhasePreMerge); !preResult.Success {
+			return preResult
+		}
+		return e.runGatesForPhase(ctx, GatePhasePostSquash)
+	}
+	if e.config.RunTests && e.config.TestCommand != "" {
+		// Legacy test command path (backward compatible).
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Running tests on merge result: %s\n", e.config.TestCommand)
+		result := e.runTests(ctx)
+		if !result.Success {
+			return ProcessResult{
+				Success:     false,
+				TestsFailed: true,
+				Error:       result.Error,
+			}
+		}
+		_, _ = fmt.Fprintln(e.output, "[Engineer] Tests passed")
+	}
 	return ProcessResult{Success: true}
 }
 
