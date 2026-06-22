@@ -482,6 +482,17 @@ func runBdJSONWithOptions(dir string, allowStale bool, args ...string) ([]byte, 
 	return stdout.Bytes(), nil
 }
 
+// dependencySchemaIsSplit caches, per beads directory, whether the dependencies
+// table uses bd's split target-column schema (depends_on_issue_id /
+// depends_on_wisp_id / depends_on_external) rather than the legacy depends_on_id
+// column. Without this cache, every bdDepListRawIDs call on a migrated database
+// fires a guaranteed-failing legacy probe first, which Dolt logs server-side.
+// On hot paths like the convoy patrol (runs ~every 8s) that floods hq Dolt logs
+// with "column depends_on_id could not be found" errors (gt-0e0). Caching the
+// detected schema means the legacy probe fires at most once per directory per
+// process. The map stores true=split, false=legacy.
+var dependencySchemaIsSplit sync.Map // map[string]bool keyed by beads dir
+
 // bdDepListRawIDs queries the raw dependencies table via bd sql to get
 // dependency target IDs. Unlike bd dep list, this does NOT join with the
 // issues table, so it works for cross-database dependencies where the
@@ -490,6 +501,10 @@ func runBdJSONWithOptions(dir string, allowStale bool, args ...string) ([]byte, 
 // dir should be the town beads directory (.beads) for HQ queries.
 // direction is "down" (issue_id → depends_on_id) or "up" (depends_on_id → issue_id).
 // depType filters by dependency type (e.g., "tracks", "blocks"); empty means all types.
+//
+// The first call against a directory probes the legacy schema and, on a
+// column-mismatch error, retries against the split schema and caches the result
+// so subsequent calls skip the failing probe. See dependencySchemaIsSplit.
 //
 // Returns deduplicated, unwrapped issue IDs (external:prefix:id → id).
 func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) {
@@ -500,14 +515,33 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		return nil, fmt.Errorf("invalid dep type: %q", depType)
 	}
 
+	// If we already learned this directory uses the split schema, skip the
+	// legacy probe entirely to avoid flooding Dolt logs with column errors.
+	if cached, ok := dependencySchemaIsSplit.Load(dir); ok && cached.(bool) {
+		ids, err := bdDepListRawIDsWithSchema(dir, issueID, direction, depType, true)
+		if err == nil {
+			return ids, nil
+		}
+		// The schema unexpectedly looks legacy again; fall through to reprobe.
+		if !isDependencyTargetColumnError(err) {
+			return nil, err
+		}
+		dependencySchemaIsSplit.Store(dir, false)
+	}
+
 	ids, err := bdDepListRawIDsWithSchema(dir, issueID, direction, depType, false)
 	if err == nil {
+		dependencySchemaIsSplit.Store(dir, false)
 		return ids, nil
 	}
 	if !isDependencyTargetColumnError(err) {
 		return nil, err
 	}
-	return bdDepListRawIDsWithSchema(dir, issueID, direction, depType, true)
+	ids, err = bdDepListRawIDsWithSchema(dir, issueID, direction, depType, true)
+	if err == nil {
+		dependencySchemaIsSplit.Store(dir, true)
+	}
+	return ids, err
 }
 
 func bdDepListRawIDsWithSchema(dir, issueID, direction, depType string, splitTarget bool) ([]string, error) {
