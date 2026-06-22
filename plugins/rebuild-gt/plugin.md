@@ -26,6 +26,25 @@ only from the main branch. Rebuilding to an older or diverged commit caused a
 crash loop where every new session's startup hook failed, the witness respawned
 it, and the loop repeated every 1-2 minutes.
 
+## Sync Local Main (gt-4tb)
+
+Before checking staleness, fast-forward the rig's LOCAL main to origin/main.
+The staleness check compares the binary to **local** main, so after the
+refinery merges a fix to origin/main, local main stays behind and `gt stale`
+reports "fresh" — the binary never picks up the merged fix.
+
+The sync (`sync_rig_main` in `run.sh`) is conservative and best-effort:
+
+```bash
+git -C "$RIG_ROOT" fetch origin main
+git -C "$RIG_ROOT" merge --ff-only origin/main
+```
+
+It only fast-forwards when the rig is **clean**, **on main**, and origin/main
+is a **strict descendant** of local main. It never forces, never creates a
+merge commit, never touches a dirty or diverged tree, and always returns
+success so a sync failure (e.g. offline) cannot abort the rebuild flow.
+
 ## Gate Check
 
 The Deacon evaluates this before dispatch. If gate closed, skip.
