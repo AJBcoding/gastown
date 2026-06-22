@@ -9,6 +9,30 @@ set -euo pipefail
 
 log() { echo "[rebuild-gt] $*"; }
 
+# resolve_town_root: locate the Gas Town root (the dir holding mayor/town.json).
+#
+# Prefers GT_TOWN_ROOT (normally exported to plugin runs) after validating it
+# actually points at a town. Falls back to walking up from $PWD for the
+# mayor/town.json marker, mirroring internal/workspace.Find in the gt binary.
+# The old `$(gt town root)` fallback is DEAD — that subcommand was removed and
+# now prints help text to stdout, silently poisoning TOWN_ROOT with garbage.
+resolve_town_root() {
+  if [ -n "${GT_TOWN_ROOT:-}" ] && [ -f "${GT_TOWN_ROOT}/mayor/town.json" ]; then
+    printf '%s\n' "$GT_TOWN_ROOT"
+    return 0
+  fi
+  local dir
+  dir=$(pwd)
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    if [ -f "$dir/mayor/town.json" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
 # --- Sync --------------------------------------------------------------------
 
 # sync_rig_main: fast-forward the rig's LOCAL main to origin/main so the
@@ -83,7 +107,10 @@ sync_rig_main() {
 # --- Main --------------------------------------------------------------------
 
 main() {
-  TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"
+  TOWN_ROOT=$(resolve_town_root) || {
+    log "FATAL: cannot resolve town root — GT_TOWN_ROOT unset/invalid and no mayor/town.json found walking up from $(pwd)"
+    return 1
+  }
   RIG_ROOT="${TOWN_ROOT}/gastown/mayor/rig"
 
   # Bring local main up to date with merged fixes BEFORE the staleness check,

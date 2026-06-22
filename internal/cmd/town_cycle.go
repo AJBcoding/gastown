@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // townCycleSession is the --session flag for town next/prev commands.
@@ -33,6 +35,7 @@ func init() {
 	rootCmd.AddCommand(townCmd)
 	townCmd.AddCommand(townNextCmd)
 	townCmd.AddCommand(townPrevCmd)
+	townCmd.AddCommand(townRootCmd)
 
 	townNextCmd.Flags().StringVar(&townCycleSession, "session", "", "Override current session (used by tmux binding)")
 	townPrevCmd.Flags().StringVar(&townCycleSession, "session", "", "Override current session (used by tmux binding)")
@@ -67,6 +70,32 @@ This command is typically invoked via the C-b p keybinding when in a
 town-level session (Mayor or Deacon).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return cycleTownSession(-1, townCycleSession)
+	},
+}
+
+// townRootCmd prints the absolute path of the current Gas Town root.
+//
+// Restored after removal broke shell tooling that used `$(gt town root)` as a
+// fallback when GT_TOWN_ROOT was unset: the missing subcommand printed help
+// text to stdout, silently poisoning callers' TOWN_ROOT (gt-0rg). Resolution
+// honors GT_TOWN_ROOT/GT_ROOT via workspace.FindFromCwdOrError.
+var townRootCmd = &cobra.Command{
+	Use:   "root",
+	Short: "Print the path to the current Gas Town root",
+	Long: `Print the absolute path of the current Gas Town root directory
+(the directory containing mayor/town.json).
+
+Resolution prefers the GT_TOWN_ROOT/GT_ROOT environment variables and otherwise
+walks up from the current directory looking for the workspace marker. Exits
+non-zero with a clear message if no town root can be found, so shell callers can
+fail loudly rather than capturing garbage.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		root, err := workspace.FindFromCwdOrError()
+		if err != nil {
+			return fmt.Errorf("resolving town root: %w", err)
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), root)
+		return nil
 	},
 }
 

@@ -6,10 +6,54 @@
 
 set -euo pipefail
 
-TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"
-RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
-
 log() { echo "[stuck-agent-dog] $*"; }
+
+# resolve_town_root: locate the Gas Town root (the dir holding mayor/town.json).
+#
+# Prefers GT_TOWN_ROOT (normally exported to plugin runs) after validating it
+# actually points at a town. Falls back to walking up from $PWD for the
+# mayor/town.json marker, mirroring internal/workspace.Find in the gt binary.
+# The old `$(gt town root)` fallback is DEAD — that subcommand was removed and
+# now prints help text to stdout, silently poisoning TOWN_ROOT with garbage.
+resolve_town_root() {
+  if [ -n "${GT_TOWN_ROOT:-}" ] && [ -f "${GT_TOWN_ROOT}/mayor/town.json" ]; then
+    printf '%s\n' "$GT_TOWN_ROOT"
+    return 0
+  fi
+  local dir
+  dir=$(pwd)
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    if [ -f "$dir/mayor/town.json" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+# run_soft CMD...: run a read-only bd/Dolt/gt command resiliently. Retries once
+# after a short pause if the first attempt fails (Dolt hiccups are transient),
+# then yields whatever stdout it captured. ALWAYS returns 0 so a single blip
+# cannot abort the health check via `set -e`/`pipefail`. A monitoring dog must
+# never self-destruct on one slow query (gt-0rg).
+run_soft() {
+  local out
+  if out=$("$@" 2>/dev/null); then
+    printf '%s' "$out"
+    return 0
+  fi
+  sleep 1
+  out=$("$@" 2>/dev/null) || true
+  printf '%s' "$out"
+  return 0
+}
+
+TOWN_ROOT=$(resolve_town_root) || {
+  log "FATAL: cannot resolve town root — GT_TOWN_ROOT unset/invalid and no mayor/town.json found walking up from $(pwd)"
+  exit 1
+}
+RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
 
 heartbeat_epoch() {
   local file="$1"
@@ -59,7 +103,7 @@ if [ ! -f "$RIGS_JSON_PATH" ]; then
 fi
 
 # Build rig_name|prefix mapping
-RIG_PREFIX_MAP=$(jq -r '.rigs | to_entries[] | "\(.key)|\(.value.beads.prefix // .key)"' "$RIGS_JSON_PATH" 2>/dev/null)
+RIG_PREFIX_MAP=$(jq -r '.rigs | to_entries[] | "\(.key)|\(.value.beads.prefix // .key)"' "$RIGS_JSON_PATH" 2>/dev/null || true)
 if [ -z "$RIG_PREFIX_MAP" ]; then
   log "SKIP: no rigs in rigs.json"
   exit 0
@@ -83,12 +127,12 @@ while IFS='|' read -r RIG PREFIX; do
 
     if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
       # Session dead — check hook
-      HOOK_OUTPUT=$(gt hook show "$RIG/polecats/$PCAT_NAME" 2>/dev/null | head -1)
+      HOOK_OUTPUT=$(run_soft gt hook show "$RIG/polecats/$PCAT_NAME" | head -1)
       HOOK_BEAD=$(echo "$HOOK_OUTPUT" | grep -v '(empty)' | awk '{print $2}' || true)
 
       if [ -n "$HOOK_BEAD" ]; then
         # Check agent_state
-        AGENT_STATE=$(bd show "$HOOK_BEAD" --json 2>/dev/null \
+        AGENT_STATE=$(run_soft bd show "$HOOK_BEAD" --json \
           | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0].get('status',''))" 2>/dev/null || echo "")
 
         case "$AGENT_STATE" in
@@ -105,7 +149,7 @@ while IFS='|' read -r RIG PREFIX; do
         PROC_COMM=$(ps -o comm= -p "$PANE_PID" 2>/dev/null)
         if [ -z "$PROC_COMM" ]; then
           # Zombie: process dead, session alive
-          HOOK_OUTPUT=$(gt hook show "$RIG/polecats/$PCAT_NAME" 2>/dev/null | head -1)
+          HOOK_OUTPUT=$(run_soft gt hook show "$RIG/polecats/$PCAT_NAME" | head -1)
           HOOK_BEAD=$(echo "$HOOK_OUTPUT" | grep -v '(empty)' | awk '{print $2}' || true)
           if [ -n "$HOOK_BEAD" ]; then
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
